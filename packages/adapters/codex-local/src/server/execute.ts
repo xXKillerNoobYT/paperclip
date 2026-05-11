@@ -5,11 +5,13 @@ import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type Adapter
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
+  overrideAdapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
   adapterExecutionTargetUsesPaperclipBridge,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
+  ensureAdapterExecutionTargetRuntimeCommandInstalled,
   prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetCommandForLogs,
@@ -20,17 +22,17 @@ import {
   asString,
   asNumber,
   parseObject,
-  applyPaperclipWorkspaceEnv,
   buildPaperclipEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
   ensurePathInEnv,
+  refreshPaperclipWorkspaceEnvForExecution,
   readPaperclipRuntimeSkillEntries,
+  readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
   renderTemplate,
   renderPaperclipWakePrompt,
-  shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
@@ -44,10 +46,18 @@ import {
 import { pathExists, prepareManagedCodexHome, resolveManagedCodexHomeDir, resolveSharedCodexHomeDir } from "./codex-home.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
+import { isCodexLocalRoutableModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_ROLLOUT_NOISE_RE =
   /^\d{4}-\d{2}-\d{2}T[^\s]+\s+ERROR\s+codex_core::rollout::list:\s+state db missing rollout path for thread\s+[a-z0-9-]+$/i;
+const CHATGPT_CODEX_COMPATIBLE_MODELS = new Set([
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.3-codex-spark",
+  "codex-mini-latest",
+]);
+const CHATGPT_CODEX_CHEAP_FALLBACK_MODEL = "gpt-5.3-codex-spark";
 
 function stripCodexRolloutNoise(text: string): string {
   const parts = text.split(/\r?\n/);
@@ -87,6 +97,13 @@ function resolveCodexBiller(env: Record<string, string>, billingType: "api" | "s
   const openAiCompatibleBiller = inferOpenAiCompatibleBiller(env, "openai");
   if (openAiCompatibleBiller === "openrouter") return "openrouter";
   return billingType === "subscription" ? "chatgpt" : openAiCompatibleBiller ?? "openai";
+}
+
+export function resolveCodexModelForBilling(model: string, billingType: "api" | "subscription"): string {
+  const normalizedModel = model.trim();
+  if (billingType !== "subscription") return normalizedModel;
+  if (!normalizedModel) return normalizedModel;
+  return CHATGPT_CODEX_COMPATIBLE_MODELS.has(normalizedModel) ? normalizedModel : CHATGPT_CODEX_CHEAP_FALLBACK_MODEL;
 }
 
 async function isLikelyPaperclipRepoRoot(candidate: string): Promise<boolean> {
@@ -287,6 +304,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const command = asString(config.command, "codex");
   const model = asString(config.model, "");
+  if (!isCodexLocalRoutableModel(model)) {
+    await onLog(
+      "stderr",
+      `[paperclip] Codex local refused model "${model}". GPT/OpenAI models must use codex_local; Claude/Sonnet/Opus models must use claude_local.\n`,
+    );
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: `Invalid codex_local model "${model}". Use claude_local for Claude/Sonnet/Opus models.`,
+      errorCode: "codex_local_model_route_mismatch",
+      errorMeta: { model, expectedAdapterType: "claude_local" },
+    };
+  }
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -331,8 +362,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const codexSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = resolveCodexDesiredSkillNames(config, codexSkillEntries);
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+  const configuredOpenAiApiKey =
+    typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
+      ? envConfig.OPENAI_API_KEY.trim()
+      : null;
   const preparedManagedCodexHome =
-    configuredCodexHome ? null : await prepareManagedCodexHome(process.env, onLog, agent.companyId);
+    configuredCodexHome
+      ? null
+      : await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
+          apiKey: configuredOpenAiApiKey,
+        });
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? preparedManagedCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
@@ -347,14 +386,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       desiredSkillNames,
     },
   );
-  const effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
-  const shapedWorkspaceEnv = shapePaperclipWorkspaceEnvForExecution({
-    workspaceCwd: effectiveWorkspaceCwd,
-    workspaceWorktreePath,
-    workspaceHints,
-    executionTargetIsRemote,
-    executionCwd: effectiveExecutionCwd,
-  });
+  let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   const preparedExecutionTargetRuntime = executionTargetIsRemote
     ? await (async () => {
         await onLog(
@@ -362,9 +394,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] Syncing workspace and CODEX_HOME to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
         );
         return await prepareAdapterExecutionTargetRuntime({
+          runId,
           target: executionTarget,
           adapterKey: "codex",
           workspaceLocalDir: cwd,
+          installCommand: SANDBOX_INSTALL_COMMAND,
+          detectCommand: command,
           assets: [
             {
               key: "home",
@@ -375,6 +410,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       })()
     : null;
+  if (preparedExecutionTargetRuntime?.workspaceRemoteDir) {
+    effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir;
+  }
+  const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
   const restoreRemoteWorkspace = preparedExecutionTargetRuntime
     ? () => preparedExecutionTargetRuntime.restoreWorkspace()
     : null;
@@ -411,8 +450,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
   const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) {
     env.PAPERCLIP_TASK_ID = wakeTaskId;
+  }
+  if (issueWorkMode) {
+    env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
   }
   if (wakeReason) {
     env.PAPERCLIP_WAKE_REASON = wakeReason;
@@ -432,20 +475,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (wakePayloadJson) {
     env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   }
-  applyPaperclipWorkspaceEnv(env, {
-    workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
+  refreshPaperclipWorkspaceEnvForExecution({
+    env,
+    envConfig,
+    workspaceCwd: effectiveWorkspaceCwd,
     workspaceSource,
     workspaceStrategy,
     workspaceId,
     workspaceRepoUrl,
     workspaceRepoRef,
     workspaceBranch,
-    workspaceWorktreePath: shapedWorkspaceEnv.workspaceWorktreePath,
+    workspaceWorktreePath,
+    workspaceHints,
     agentHome,
+    executionTargetIsRemote,
+    executionCwd: effectiveExecutionCwd,
   });
-  if (shapedWorkspaceEnv.workspaceHints.length > 0) {
-    env.PAPERCLIP_WORKSPACES_JSON = JSON.stringify(shapedWorkspaceEnv.workspaceHints);
-  }
   if (runtimeServiceIntents.length > 0) {
     env.PAPERCLIP_RUNTIME_SERVICE_INTENTS_JSON = JSON.stringify(runtimeServiceIntents);
   }
@@ -455,17 +500,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (runtimePrimaryUrl) {
     env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
   }
-  for (const [k, v] of Object.entries(envConfig)) {
-    if (typeof v === "string") env[k] = v;
-  }
   env.CODEX_HOME = remoteCodexHome ?? effectiveCodexHome;
   if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget)) {
+  if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(runtimeExecutionTarget)) {
     paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
       runId,
-      target: executionTarget,
+      target: runtimeExecutionTarget,
       runtimeRootDir: preparedExecutionTargetRuntime?.runtimeRootDir,
       adapterKey: "codex",
       hostApiToken: env.PAPERCLIP_API_KEY,
@@ -481,7 +523,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ),
   );
   const billingType = resolveCodexBillingType(effectiveEnv);
-  const runtimeEnv = ensurePathInEnv(effectiveEnv);
+  const effectiveModel = resolveCodexModelForBilling(model, billingType);
+  if (model.trim() && effectiveModel !== model.trim()) {
+    await onLog(
+      "stdout",
+      `[paperclip] Codex local replaced model "${model.trim()}" with "${effectiveModel}" because ChatGPT-account Codex does not support that model.\n`,
+    );
+  }
+  const runtimeEnv = Object.fromEntries(
+    Object.entries(ensurePathInEnv(effectiveEnv)).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    ),
+  );
+  await ensureAdapterExecutionTargetRuntimeCommandInstalled({
+    runId,
+    target: executionTarget,
+    installCommand: ctx.runtimeCommandSpec?.installCommand,
+    detectCommand: ctx.runtimeCommandSpec?.detectCommand,
+    cwd,
+    env: runtimeEnv,
+    timeoutSec: asNumber(config.timeoutSec, 0),
+    graceSec: asNumber(config.graceSec, 20),
+    onLog,
+  });
   await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv);
   const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
   const loggedEnv = buildInvocationEnvForLogs(env, {
@@ -500,7 +564,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
-    adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
+    adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
   const codexTransientFallbackMode = readCodexTransientFallbackMode(context);
   const forceSaferInvocation = fallbackModeUsesSaferInvocation(codexTransientFallbackMode);
   const forceFreshSession = fallbackModeUsesFreshSession(codexTransientFallbackMode);
@@ -637,8 +701,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const runAttempt = async (resumeSessionId: string | null) => {
+    const attemptConfig =
+      effectiveModel && effectiveModel !== model.trim()
+        ? { ...config, model: effectiveModel }
+        : config;
     const execArgs = buildCodexExecArgs(
-      forceSaferInvocation ? { ...config, fastMode: false } : config,
+      forceSaferInvocation ? { ...attemptConfig, fastMode: false } : attemptConfig,
       { resumeSessionId },
     );
     const args = execArgs.args;
@@ -663,7 +731,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
+    const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
       env,
       stdin: prompt,
@@ -716,7 +784,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         cwd: effectiveExecutionCwd,
         ...(executionTargetIsRemote
           ? {
-              remoteExecution: adapterExecutionTargetSessionIdentity(executionTarget),
+              remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
             }
           : {}),
         ...(workspaceId ? { workspaceId } : {}),
@@ -766,7 +834,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionDisplayId: resolvedSessionId,
       provider: "openai",
       biller: resolveCodexBiller(effectiveEnv, billingType),
-      model,
+      model: effectiveModel || model,
       billingType,
       costUsd: null,
       resultJson: {
@@ -775,6 +843,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
         ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
         ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+        ...(effectiveModel !== model.trim() ? { configuredModel: model.trim(), effectiveModel } : {}),
       },
       summary: attempt.parsed.summary,
       clearSession: Boolean((clearSessionOnMissingSession || forceFreshSession) && !resolvedSessionId),
