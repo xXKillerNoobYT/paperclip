@@ -605,7 +605,7 @@ describe.sequential("plugin tool and bridge authz", () => {
 
   it("allows manual job triggers for instance admins", async () => {
     readyPlugin();
-    const scheduler = { triggerJob: vi.fn().mockResolvedValue({ runId: "run-1", jobId: "job-1" }) };
+    const scheduler = { triggerJob: vi.fn().mockResolvedValue({ runId: "run-1", jobId: "job-1", reused: false }) };
     const jobStore = { getJobByIdForPlugin: vi.fn().mockResolvedValue({ id: "job-1" }) };
     const { app } = await createApp(boardActor({
       userId: "admin-1",
@@ -620,7 +620,31 @@ describe.sequential("plugin tool and bridge authz", () => {
       .send({});
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ runId: "run-1", jobId: "job-1" });
-    expect(scheduler.triggerJob).toHaveBeenCalledWith("job-1", "manual");
+    expect(res.body).toEqual({ runId: "run-1", jobId: "job-1", reused: false });
+    expect(scheduler.triggerJob).toHaveBeenCalledWith("job-1", "manual", { idempotencyKey: null });
+  });
+
+  it("passes idempotency keys and retry triggers to manual job execution", async () => {
+    readyPlugin();
+    const scheduler = { triggerJob: vi.fn().mockResolvedValue({ runId: "run-1", jobId: "job-1", reused: true }) };
+    const jobStore = { getJobByIdForPlugin: vi.fn().mockResolvedValue({ id: "job-1" }) };
+    const { app } = await createApp(boardActor({
+      userId: "admin-1",
+      isInstanceAdmin: true,
+      companyIds: [],
+    }), {}, {
+      jobDeps: { scheduler, jobStore },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/jobs/job-1/trigger`)
+      .set("Idempotency-Key", " retry-job-1 ")
+      .send({ trigger: "retry", idempotencyKey: "ignored-body-key" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ runId: "run-1", jobId: "job-1", reused: true });
+    expect(scheduler.triggerJob).toHaveBeenCalledWith("job-1", "retry", {
+      idempotencyKey: "retry-job-1",
+    });
   });
 });

@@ -961,6 +961,7 @@ export const PLUGIN_JOB_RUN_STATUSES = [
   "running",
   "succeeded",
   "failed",
+  "dead_letter",
   "cancelled",
 ] as const;
 export type PluginJobRunStatus = (typeof PLUGIN_JOB_RUN_STATUSES)[number];

@@ -304,6 +304,37 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
 });
 
 describe("realizeExecutionWorkspace", () => {
+  it("detects the current git branch for project-primary workspaces", async () => {
+    const repoRoot = await createTempRepo("feature/current-branch");
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {},
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Use primary workspace",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(workspace.strategy).toBe("project_primary");
+    expect(workspace.created).toBe(false);
+    expect(workspace.branchName).toBe("feature/current-branch");
+    expect(workspace.cwd).toBe(repoRoot);
+  });
+
   it("creates and reuses a git worktree for an issue-scoped branch", async () => {
     const repoRoot = await createTempRepo();
 

@@ -1173,7 +1173,7 @@ function JobStatusDot({ status }: { status: string }) {
   const colorClass =
     status === "success" || status === "succeeded"
       ? "bg-green-500"
-      : status === "failed"
+      : status === "failed" || status === "dead_letter"
         ? "bg-red-500"
         : status === "running"
           ? "bg-blue-500 animate-pulse"

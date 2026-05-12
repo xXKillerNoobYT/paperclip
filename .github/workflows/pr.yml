@@ -48,6 +48,9 @@ jobs:
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
+      - name: Lint
+        run: pnpm run lint
+
       - name: Verify release package bootstrap for changed manifests
         run: |
           mapfile -t changed_paths < <(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
@@ -84,6 +87,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
 
       - name: Typecheck workspaces whose build scripts skip TypeScript
         run: pnpm run typecheck:build-gaps
@@ -226,4 +232,54 @@ jobs:
           path: |
             tests/e2e/playwright-report/
             tests/e2e/test-results/
+          retention-days: 14
+
+  wei_716_release_smoke:
+    name: WEI-716 Release Smoke
+    needs: [policy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run onboarding vertical slice Docker smoke
+        env:
+          PAPERCLIPAI_VERSION: canary
+          PRESERVE_SMOKE_CONTAINER: "true"
+        run: ./scripts/smoke/onboarding-vertical-slice.sh
+
+      - name: Capture Docker diagnostics
+        if: always()
+        run: |
+          docker ps -a || true
+          docker logs paperclip-onboarding-vertical-slice-smoke >/tmp/wei-716-docker.log 2>&1 || true
+
+      - name: Upload Docker smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wei-716-release-smoke
+          path: |
+            /tmp/wei-716-docker.log
+            tests/release-smoke/playwright-report/
+            tests/release-smoke/test-results/
           retention-days: 14

@@ -237,6 +237,19 @@ async function resolvePlugin(
   return registry.getByKey(pluginId);
 }
 
+function normalizePluginJobIdempotencyKey(value: unknown): string | null | Error {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    return new Error("idempotencyKey must be a string");
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.length > 255) {
+    return new Error("idempotencyKey must be 255 characters or fewer");
+  }
+  return trimmed;
+}
+
 /**
  * Optional dependencies for plugin job scheduling routes.
  *
@@ -2198,7 +2211,9 @@ export function pluginRoutes(
    *
    * Manually trigger a job execution outside its cron schedule.
    *
-   * Creates a run with `trigger: "manual"` and dispatches immediately.
+   * Creates a run with `trigger: "manual"` and dispatches immediately. Clients
+   * may pass an idempotency key in `Idempotency-Key` or `body.idempotencyKey`
+   * to safely retry duplicate submits and receive the original run result.
    * The response returns before the job completes (non-blocking).
    *
    * Response: `{ runId: string, jobId: string }`
@@ -2227,7 +2242,29 @@ export function pluginRoutes(
     }
 
     try {
-      const result = await jobDeps.scheduler.triggerJob(jobId, "manual");
+      const requestedTrigger = req.body?.trigger;
+      if (
+        requestedTrigger !== undefined
+        && requestedTrigger !== "manual"
+        && requestedTrigger !== "retry"
+      ) {
+        res.status(400).json({ error: "trigger must be manual or retry" });
+        return;
+      }
+
+      const idempotencyKey = normalizePluginJobIdempotencyKey(
+        req.get("Idempotency-Key") ?? req.body?.idempotencyKey,
+      );
+      if (idempotencyKey instanceof Error) {
+        res.status(400).json({ error: idempotencyKey.message });
+        return;
+      }
+
+      const result = await jobDeps.scheduler.triggerJob(
+        jobId,
+        requestedTrigger === "retry" ? "retry" : "manual",
+        { idempotencyKey },
+      );
       res.json(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

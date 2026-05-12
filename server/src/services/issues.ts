@@ -2773,7 +2773,6 @@ export function issueService(db: Db) {
           Math.max(clampIssueRequestDepth(parent.requestDepth) + 1, issueData.requestDepth ?? 0),
         ),
         description: appendAcceptanceCriteriaToDescription(issueData.description, acceptanceCriteria),
-        inheritExecutionWorkspaceFromIssueId: parent.id,
       });
 
       if (blockParentUntilDone) {
@@ -2831,6 +2830,7 @@ export function issueService(db: Db) {
         let executionWorkspacePreference = issueData.executionWorkspacePreference ?? null;
         let executionWorkspaceSettings =
           (issueData.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null;
+        const hasExplicitWorkspaceInheritance = inheritExecutionWorkspaceFromIssueId != null;
         const workspaceInheritanceIssueId = inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
         const hasExplicitExecutionWorkspaceOverride =
           issueData.executionWorkspaceId !== undefined ||
@@ -2855,12 +2855,16 @@ export function issueService(db: Db) {
               .where(eq(executionWorkspaces.id, workspaceSource.executionWorkspaceId))
               .then((rows) => rows[0] ?? null);
             if (sourceWorkspace) {
-              executionWorkspaceId = sourceWorkspace.id;
-              executionWorkspacePreference = "reuse_existing";
-              executionWorkspaceSettings = {
-                ...((workspaceSource.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? {}),
-                mode: issueExecutionWorkspaceModeForPersistedWorkspace(sourceWorkspace.mode),
-              };
+              const shouldReuseInheritedWorkspace =
+                hasExplicitWorkspaceInheritance || sourceWorkspace.mode !== "shared_workspace";
+              if (shouldReuseInheritedWorkspace) {
+                executionWorkspaceId = sourceWorkspace.id;
+                executionWorkspacePreference = "reuse_existing";
+                executionWorkspaceSettings = {
+                  ...((workspaceSource.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? {}),
+                  mode: issueExecutionWorkspaceModeForPersistedWorkspace(sourceWorkspace.mode),
+                };
+              }
             }
           }
         }

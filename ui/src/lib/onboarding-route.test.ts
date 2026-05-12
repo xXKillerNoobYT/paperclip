@@ -20,13 +20,36 @@ describe("isOnboardingPath", () => {
 });
 
 describe("resolveRouteOnboardingOptions", () => {
-  it("opens company creation for the global onboarding route", () => {
+  it("opens company creation for the global onboarding route when no company exists", () => {
     expect(
       resolveRouteOnboardingOptions({
         pathname: "/onboarding",
         companies: [],
       }),
     ).toEqual({ initialStep: 1 });
+  });
+
+  it("opens agent creation for the selected company on the global onboarding route", () => {
+    expect(
+      resolveRouteOnboardingOptions({
+        pathname: "/onboarding",
+        selectedCompanyId: "company-2",
+        companies: [
+          { id: "company-1", issuePrefix: "PAP" },
+          { id: "company-2", issuePrefix: "WEI" },
+        ],
+      }),
+    ).toEqual({ initialStep: 2, companyId: "company-2" });
+  });
+
+  it("opens agent creation for the first company on the global onboarding route when selection is stale", () => {
+    expect(
+      resolveRouteOnboardingOptions({
+        pathname: "/onboarding",
+        selectedCompanyId: "missing-company",
+        companies: [{ id: "company-1", issuePrefix: "PAP" }],
+      }),
+    ).toEqual({ initialStep: 2, companyId: "company-1" });
   });
 
   it("opens agent creation when the prefixed company exists", () => {
@@ -39,7 +62,18 @@ describe("resolveRouteOnboardingOptions", () => {
     ).toEqual({ initialStep: 2, companyId: "company-1" });
   });
 
-  it("falls back to company creation when the prefixed company is missing", () => {
+  it("falls back to an existing company when the prefixed company is missing", () => {
+    expect(
+      resolveRouteOnboardingOptions({
+        pathname: "/pap/onboarding",
+        companyPrefix: "pap",
+        selectedCompanyId: "company-2",
+        companies: [{ id: "company-2", issuePrefix: "WEI" }],
+      }),
+    ).toEqual({ initialStep: 2, companyId: "company-2" });
+  });
+
+  it("falls back to company creation when the prefixed company is missing and no companies exist", () => {
     expect(
       resolveRouteOnboardingOptions({
         pathname: "/pap/onboarding",

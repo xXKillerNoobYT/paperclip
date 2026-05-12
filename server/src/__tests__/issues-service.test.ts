@@ -2430,6 +2430,86 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("does not implicitly reuse a parent shared workspace for child issues", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        allowIssueOverride: true,
+        defaultProjectWorkspaceId: projectWorkspaceId,
+      },
+    });
+
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary workspace",
+      isPrimary: true,
+      sharedWorkspaceKey: "workspace-key",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Shared project checkout",
+      status: "active",
+      providerType: "local_fs",
+      providerRef: `/tmp/${executionWorkspaceId}`,
+    });
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: {
+        mode: "shared_workspace",
+      },
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      title: "Child issue",
+    });
+
+    expect(child.parentId).toBe(parentIssueId);
+    expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
+    expect(child.executionWorkspaceId).toBeNull();
+    expect(child.executionWorkspacePreference).toBeNull();
+    expect(child.executionWorkspaceSettings).toEqual({
+      mode: "isolated_workspace",
+    });
+  });
+
   it("keeps explicit workspace fields instead of inheriting the parent linkage", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

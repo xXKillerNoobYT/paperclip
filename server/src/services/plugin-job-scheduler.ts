@@ -85,6 +85,12 @@ export interface TriggerJobResult {
   runId: string;
   /** The job ID that was triggered. */
   jobId: string;
+  /** True when an idempotency key reused a durable existing run result. */
+  reused: boolean;
+}
+
+export interface TriggerJobOptions {
+  idempotencyKey?: string | null;
 }
 
 /**
@@ -157,7 +163,11 @@ export interface PluginJobScheduler {
    * @returns The created run info
    * @throws {Error} if the job is not found, not active, or already running
    */
-  triggerJob(jobId: string, trigger?: "manual" | "retry"): Promise<TriggerJobResult>;
+  triggerJob(
+    jobId: string,
+    trigger?: "manual" | "retry",
+    options?: TriggerJobOptions,
+  ): Promise<TriggerJobResult>;
 
   /**
    * Run a single scheduler tick immediately (for testing).
@@ -402,7 +412,7 @@ export function createPluginJobScheduler(
       if (runId) {
         try {
           await jobStore.completeRun(runId, {
-            status: "failed",
+            status: "dead_letter",
             error: errorMessage,
             durationMs,
           });
@@ -439,6 +449,7 @@ export function createPluginJobScheduler(
   async function triggerJob(
     jobId: string,
     trigger: "manual" | "retry" = "manual",
+    triggerOptions: TriggerJobOptions = {},
   ): Promise<TriggerJobResult> {
     const job = await jobStore.getJobById(jobId);
     if (!job) {
@@ -449,6 +460,18 @@ export function createPluginJobScheduler(
       throw new Error(
         `Job "${job.jobKey}" is not active (status: ${job.status})`,
       );
+    }
+
+    const idempotencyKey = normalizeIdempotencyKey(triggerOptions.idempotencyKey);
+    if (idempotencyKey) {
+      const existing = await jobStore.findRunByIdempotencyKey(
+        jobId,
+        trigger,
+        idempotencyKey,
+      );
+      if (existing) {
+        return { runId: existing.id, jobId, reused: true };
+      }
     }
 
     // Overlap prevention
@@ -483,16 +506,30 @@ export function createPluginJobScheduler(
     }
 
     // Create the run and dispatch (non-blocking)
-    const run = await jobStore.createRun({
-      jobId,
-      pluginId: job.pluginId,
-      trigger,
-    });
+    const { run, created } = idempotencyKey
+      ? await jobStore.createRunIdempotently({
+        jobId,
+        pluginId: job.pluginId,
+        trigger,
+        idempotencyKey,
+      })
+      : {
+        run: await jobStore.createRun({
+          jobId,
+          pluginId: job.pluginId,
+          trigger,
+        }),
+        created: true,
+      };
+
+    if (!created) {
+      return { runId: run.id, jobId, reused: true };
+    }
 
     // Dispatch in background — don't block the caller
     void dispatchManualRun(job, run.id, trigger);
 
-    return { runId: run.id, jobId };
+    return { runId: run.id, jobId, reused: false };
   }
 
   /**
@@ -540,7 +577,7 @@ export function createPluginJobScheduler(
 
       try {
         await jobStore.completeRun(runId, {
-          status: "failed",
+          status: "dead_letter",
           error: errorMessage,
           durationMs,
         });
@@ -734,6 +771,12 @@ export function createPluginJobScheduler(
       tickCount,
       lastTickAt: lastTickAt?.toISOString() ?? null,
     };
+  }
+
+  function normalizeIdempotencyKey(value: string | null | undefined): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
   }
 
   // -----------------------------------------------------------------------

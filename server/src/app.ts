@@ -30,6 +30,7 @@ import { sidebarBadgeRoutes } from "./routes/sidebar-badges.js";
 import { sidebarPreferenceRoutes } from "./routes/sidebar-preferences.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
+import { onboardingObservabilityRoutes } from "./routes/onboarding-observability.js";
 import {
   instanceDatabaseBackupRoutes,
   type InstanceDatabaseBackupService,
@@ -59,6 +60,7 @@ import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
+import { onboardingObservabilityMiddleware } from "./services/onboarding-observability.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
@@ -144,6 +146,7 @@ export async function createApp(
       (req as unknown as { rawBody: Buffer }).rawBody = buf;
     },
   }));
+  app.use(onboardingObservabilityMiddleware);
   app.use(httpLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
@@ -211,6 +214,7 @@ export async function createApp(
   api.use(sidebarPreferenceRoutes(db));
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
+  api.use(onboardingObservabilityRoutes());
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }

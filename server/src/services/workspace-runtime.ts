@@ -590,6 +590,12 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
+async function detectCurrentGitBranch(cwd: string): Promise<string | null> {
+  const branch = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], cwd).catch(() => null);
+  if (!branch || branch === "HEAD") return null;
+  return branch;
+}
+
 async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   // Try the explicit remote HEAD first (set by git clone or git remote set-head)
   try {
@@ -995,11 +1001,12 @@ export async function realizeExecutionWorkspace(input: {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
   const strategyType = asString(rawStrategy.type, "project_primary");
   if (strategyType !== "git_worktree") {
+    const branchName = await detectCurrentGitBranch(input.base.baseCwd);
     return {
       ...input.base,
       strategy: "project_primary",
       cwd: input.base.baseCwd,
-      branchName: null,
+      branchName,
       worktreePath: null,
       warnings: [],
       created: false,

@@ -150,19 +150,20 @@ function LegacySettingsRedirect() {
 }
 
 function OnboardingRoutePage() {
-  const { companies } = useCompany();
+  const { companies, selectedCompany } = useCompany();
   const { openOnboarding } = useDialogActions();
   const { companyPrefix } = useParams<{ companyPrefix?: string }>();
   const matchedCompany = companyPrefix
     ? companies.find((company) => company.issuePrefix.toUpperCase() === companyPrefix.toUpperCase()) ?? null
     : null;
+  const existingCompany = matchedCompany ?? selectedCompany ?? companies[0] ?? null;
 
-  const title = matchedCompany
-    ? `Add another agent to ${matchedCompany.name}`
+  const title = existingCompany
+    ? `Add another agent to ${existingCompany.name}`
     : companies.length > 0
       ? "Create another company"
       : "Create your first company";
-  const description = matchedCompany
+  const description = existingCompany
     ? "Run onboarding again to add an agent and a starter task for this company."
     : companies.length > 0
       ? "Run onboarding again to create another company and seed its first agent."
@@ -176,12 +177,12 @@ function OnboardingRoutePage() {
         <div className="mt-4">
           <Button
             onClick={() =>
-              matchedCompany
-                ? openOnboarding({ initialStep: 2, companyId: matchedCompany.id })
+              existingCompany
+                ? openOnboarding({ initialStep: 2, companyId: existingCompany.id })
                 : openOnboarding()
             }
           >
-            {matchedCompany ? "Add Agent" : "Start Onboarding"}
+            {existingCompany ? "Add Agent" : "Start Onboarding"}
           </Button>
         </div>
       </div>

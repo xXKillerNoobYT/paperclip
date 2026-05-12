@@ -25,9 +25,20 @@ export type BetterAuthSessionResult = {
 };
 
 type BetterAuthInstance = ReturnType<typeof betterAuth>;
+type BetterAuthSessionOptions = NonNullable<Parameters<typeof betterAuth>[0]["session"]>;
 
 const AUTH_COOKIE_PREFIX_FALLBACK = "default";
 const AUTH_COOKIE_PREFIX_INVALID_SEGMENTS_RE = /[^a-zA-Z0-9_-]+/g;
+export const DEFAULT_AUTH_SESSION_EXPIRES_IN_SECONDS = 60 * 60 * 24 * 7;
+export const DEFAULT_AUTH_SESSION_UPDATE_AGE_SECONDS = 60 * 60 * 24;
+export const DEFAULT_AUTH_SESSION_FRESH_AGE_SECONDS = 60 * 15;
+
+function positiveIntegerFromEnv(name: string): number | null {
+  const raw = process.env[name]?.trim();
+  if (!raw) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
 
 export function deriveAuthCookiePrefix(instanceId = resolvePaperclipInstanceId()): string {
   const scopedInstanceId = instanceId
@@ -41,6 +52,24 @@ export function buildBetterAuthAdvancedOptions(input: { disableSecureCookies: bo
   return {
     cookiePrefix: deriveAuthCookiePrefix(),
     ...(input.disableSecureCookies ? { useSecureCookies: false } : {}),
+  };
+}
+
+export function buildBetterAuthSessionOptions(): BetterAuthSessionOptions {
+  const expiresIn =
+    positiveIntegerFromEnv("PAPERCLIP_AUTH_SESSION_EXPIRES_IN_SECONDS") ??
+    DEFAULT_AUTH_SESSION_EXPIRES_IN_SECONDS;
+  const updateAge =
+    positiveIntegerFromEnv("PAPERCLIP_AUTH_SESSION_UPDATE_AGE_SECONDS") ??
+    DEFAULT_AUTH_SESSION_UPDATE_AGE_SECONDS;
+  const freshAge =
+    positiveIntegerFromEnv("PAPERCLIP_AUTH_SESSION_FRESH_AGE_SECONDS") ??
+    DEFAULT_AUTH_SESSION_FRESH_AGE_SECONDS;
+
+  return {
+    expiresIn,
+    updateAge,
+    freshAge,
   };
 }
 
@@ -120,6 +149,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
     },
+    session: buildBetterAuthSessionOptions(),
     advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies: isHttpOnly }),
   };
 

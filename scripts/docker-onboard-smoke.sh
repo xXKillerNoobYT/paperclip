@@ -91,6 +91,7 @@ generate_bootstrap_invite_url() {
       -e PAPERCLIP_DEPLOYMENT_MODE="$PAPERCLIP_DEPLOYMENT_MODE" \
       -e PAPERCLIP_DEPLOYMENT_EXPOSURE="$PAPERCLIP_DEPLOYMENT_EXPOSURE" \
       -e PAPERCLIP_PUBLIC_URL="$PAPERCLIP_PUBLIC_URL" \
+      -e PAPERCLIPAI_VERSION="$PAPERCLIPAI_VERSION" \
       -e PAPERCLIP_HOME="/paperclip" \
       "$CONTAINER_NAME" bash -lc \
       'timeout 20s npx --yes "paperclipai@${PAPERCLIPAI_VERSION}" auth bootstrap-ceo --data-dir "$PAPERCLIP_HOME" --base-url "$PAPERCLIP_PUBLIC_URL"' \
