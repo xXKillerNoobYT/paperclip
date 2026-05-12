@@ -5,6 +5,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 
 const mockIssueService = vi.hoisted(() => ({
+  list: vi.fn(),
   getById: vi.fn(),
   getAncestors: vi.fn(),
   getRelationSummaries: vi.fn(),
@@ -13,6 +14,7 @@ const mockIssueService = vi.hoisted(() => ({
   getComment: vi.fn(),
   listBlockerAttention: vi.fn(),
   listProductivityReviews: vi.fn(),
+  getCurrentScheduledRetry: vi.fn(),
   listAttachments: vi.fn(),
 }));
 
@@ -91,6 +93,11 @@ const mockWorkProductService = vi.hoisted(() => ({
 
 const mockEnvironmentService = vi.hoisted(() => ({}));
 
+const mockDb = vi.hoisted(() => ({
+  select: vi.fn(),
+  execute: vi.fn(),
+}));
+
 vi.mock("../services/index.js", () => ({
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
@@ -107,6 +114,9 @@ vi.mock("../services/index.js", () => ({
   issueApprovalService: () => ({}),
   issueReferenceService: () => mockIssueReferenceService,
   issueService: () => mockIssueService,
+  ISSUE_LIST_DEFAULT_LIMIT: 100,
+  ISSUE_LIST_MAX_LIMIT: 500,
+  clampIssueListLimit: (value: number) => value,
   logActivity: mockLogActivity,
   projectService: () => mockProjectService,
   routineService: () => mockRoutineService,
@@ -130,7 +140,7 @@ function createApp() {
     };
     next();
   });
-  app.use("/api", issueRoutes({} as any, {} as any));
+  app.use("/api", issueRoutes(mockDb as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -142,6 +152,7 @@ const legacyProjectLinkedIssue = {
   title: "Legacy onboarding task",
   description: "Seed the first CEO task",
   status: "todo",
+  workMode: "planning",
   priority: "medium",
   projectId: "22222222-2222-4222-8222-222222222222",
   goalId: null,
@@ -152,6 +163,14 @@ const legacyProjectLinkedIssue = {
   executionWorkspaceId: null,
   labels: [],
   labelIds: [],
+};
+
+const unlinkedIssue = {
+  ...legacyProjectLinkedIssue,
+  id: "55555555-5555-4555-8555-555555555555",
+  identifier: "PAP-582",
+  title: "Unlinked onboarding task",
+  projectId: null,
 };
 
 const projectGoal = {
@@ -171,6 +190,7 @@ describe.sequential("issue goal context routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(legacyProjectLinkedIssue);
+    mockIssueService.list.mockResolvedValue([legacyProjectLinkedIssue]);
     mockIssueService.getAncestors.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.findMentionedProjectIds.mockResolvedValue([]);
@@ -182,10 +202,19 @@ describe.sequential("issue goal context routes", () => {
     mockIssueService.getComment.mockResolvedValue(null);
     mockIssueService.listBlockerAttention.mockResolvedValue(new Map());
     mockIssueService.listProductivityReviews.mockResolvedValue(new Map());
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
     mockIssueService.listAttachments.mockResolvedValue([]);
     mockDocumentsService.getIssueDocumentPayload.mockResolvedValue({});
     mockDocumentsService.getIssueDocumentByKey.mockResolvedValue(null);
     mockExecutionWorkspaceService.getById.mockResolvedValue(null);
+    mockDb.select.mockReturnValue({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          orderBy: vi.fn(async () => []),
+        })),
+      })),
+    });
+    mockDb.execute.mockResolvedValue([]);
     mockProjectService.getById.mockResolvedValue({
       id: legacyProjectLinkedIssue.projectId,
       companyId: "company-1",
@@ -219,7 +248,23 @@ describe.sequential("issue goal context routes", () => {
       createdAt: new Date("2026-03-20T00:00:00Z"),
       updatedAt: new Date("2026-03-20T00:00:00Z"),
     });
-    mockProjectService.listByIds.mockResolvedValue([]);
+    mockProjectService.listByIds.mockResolvedValue([
+      {
+        id: legacyProjectLinkedIssue.projectId,
+        companyId: "company-1",
+        name: "Onboarding",
+        status: "in_progress",
+        targetDate: null,
+        codebase: {
+          managedFolder: "/tmp/company-1/project-1",
+          effectiveLocalFolder: "/tmp/company-1/project-1",
+        },
+        workspaces: [{ id: "workspace-1" }],
+        primaryWorkspace: { id: "workspace-1" },
+        executionWorkspacePolicy: { mode: "isolated" },
+        goals: [{ id: projectGoal.id, title: projectGoal.title }],
+      },
+    ]);
     mockGoalService.getById.mockImplementation(async (id: string) =>
       id === projectGoal.id ? projectGoal : null,
     );
@@ -231,6 +276,21 @@ describe.sequential("issue goal context routes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.goalId).toBe(projectGoal.id);
+    expect(res.body.project).toEqual({
+      id: legacyProjectLinkedIssue.projectId,
+      name: "Onboarding",
+      status: "in_progress",
+      targetDate: null,
+    });
+    expect(res.body.goal).toEqual({
+      id: projectGoal.id,
+      title: projectGoal.title,
+      status: projectGoal.status,
+      level: projectGoal.level,
+      parentId: projectGoal.parentId,
+    });
+    expect(res.body.project).not.toHaveProperty("codebase");
+    expect(res.body.project).not.toHaveProperty("workspaces");
     expect(res.body.goal).toEqual(
       expect.objectContaining({
         id: projectGoal.id,
@@ -251,6 +311,22 @@ describe.sequential("issue goal context routes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.issue.goalId).toBe(projectGoal.id);
+    expect(res.body.issue.project).toEqual({
+      id: legacyProjectLinkedIssue.projectId,
+      name: "Onboarding",
+      status: "in_progress",
+      targetDate: null,
+    });
+    expect(res.body.issue.goal).toEqual({
+      id: projectGoal.id,
+      title: projectGoal.title,
+      status: projectGoal.status,
+      level: projectGoal.level,
+      parentId: projectGoal.parentId,
+    });
+    expect(res.body.issue.project).not.toHaveProperty("codebase");
+    expect(res.body.issue.project).not.toHaveProperty("workspaces");
+    expect(res.body.issue.workMode).toBe("planning");
     expect(res.body.goal).toEqual(
       expect.objectContaining({
         id: projectGoal.id,
@@ -259,6 +335,41 @@ describe.sequential("issue goal context routes", () => {
     );
     expect(mockGoalService.getDefaultCompanyGoal).not.toHaveBeenCalled();
     expect(res.body.attachments).toEqual([]);
+  });
+
+  it("enriches GET /companies/:companyId/issues rows with project objects when projectId is present", async () => {
+    const res = await request(createApp()).get("/api/companies/company-1/issues");
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.list).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      limit: 100,
+      offset: 0,
+    }));
+    expect(mockProjectService.listByIds).toHaveBeenCalledWith("company-1", [legacyProjectLinkedIssue.projectId]);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].project).toEqual({
+      id: legacyProjectLinkedIssue.projectId,
+      name: "Onboarding",
+      status: "in_progress",
+      targetDate: null,
+    });
+    expect(res.body[0].project).not.toHaveProperty("codebase");
+    expect(res.body[0].project).not.toHaveProperty("workspaces");
+    expect(res.body[0].project).not.toHaveProperty("primaryWorkspace");
+    expect(res.body[0].project).not.toHaveProperty("executionWorkspacePolicy");
+    expect(res.body[0].project).not.toHaveProperty("goals");
+  });
+
+  it("returns null project values from GET /companies/:companyId/issues when projectId is null", async () => {
+    mockIssueService.list.mockResolvedValue([unlinkedIssue]);
+
+    const res = await request(createApp()).get("/api/companies/company-1/issues");
+
+    expect(res.status).toBe(200);
+    expect(mockProjectService.listByIds).not.toHaveBeenCalled();
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].projectId).toBeNull();
+    expect(res.body[0].project).toBeNull();
   });
 
   it("preserves direct continuation summary lookup in GET /issues/:id/heartbeat-context", async () => {

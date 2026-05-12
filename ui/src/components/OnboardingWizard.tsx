@@ -71,7 +71,12 @@ const DEFAULT_TASK_DESCRIPTION = `You are the CEO. You set the direction for the
 
 export function OnboardingWizard() {
   const { onboardingOpen, onboardingOptions, closeOnboarding } = useDialog();
-  const { companies, setSelectedCompanyId, loading: companiesLoading } = useCompany();
+  const {
+    companies,
+    selectedCompanyId,
+    setSelectedCompanyId,
+    loading: companiesLoading
+  } = useCompany();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useLocation();
@@ -88,6 +93,7 @@ export function OnboardingWizard() {
           pathname: location.pathname,
           companyPrefix,
           companies,
+          selectedCompanyId,
         });
   const effectiveOnboardingOpen =
     onboardingOpen || (routeOnboardingOptions !== null && !routeDismissed);

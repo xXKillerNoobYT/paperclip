@@ -3,6 +3,18 @@ type OnboardingRouteCompany = {
   issuePrefix: string;
 };
 
+function selectExistingCompanyId(params: {
+  companies: OnboardingRouteCompany[];
+  selectedCompanyId?: string | null;
+}): string | null {
+  const { companies, selectedCompanyId } = params;
+  if (companies.length === 0) return null;
+  if (selectedCompanyId && companies.some((company) => company.id === selectedCompanyId)) {
+    return selectedCompanyId;
+  }
+  return companies[0]?.id ?? null;
+}
+
 export function isOnboardingPath(pathname: string): boolean {
   const segments = pathname.split("/").filter(Boolean);
 
@@ -21,12 +33,17 @@ export function resolveRouteOnboardingOptions(params: {
   pathname: string;
   companyPrefix?: string;
   companies: OnboardingRouteCompany[];
+  selectedCompanyId?: string | null;
 }): { initialStep: 1 | 2; companyId?: string } | null {
-  const { pathname, companyPrefix, companies } = params;
+  const { pathname, companyPrefix, companies, selectedCompanyId } = params;
 
   if (!isOnboardingPath(pathname)) return null;
 
   if (!companyPrefix) {
+    const existingCompanyId = selectExistingCompanyId({ companies, selectedCompanyId });
+    if (existingCompanyId) {
+      return { initialStep: 2, companyId: existingCompanyId };
+    }
     return { initialStep: 1 };
   }
 
@@ -37,6 +54,10 @@ export function resolveRouteOnboardingOptions(params: {
     ) ?? null;
 
   if (!matchedCompany) {
+    const existingCompanyId = selectExistingCompanyId({ companies, selectedCompanyId });
+    if (existingCompanyId) {
+      return { initialStep: 2, companyId: existingCompanyId };
+    }
     return { initialStep: 1 };
   }
 

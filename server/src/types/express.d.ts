@@ -3,6 +3,7 @@ export {};
 declare global {
   namespace Express {
     interface Request {
+      correlationId?: string;
       actor: {
         type: "board" | "agent" | "none";
         userId?: string;
@@ -19,7 +20,7 @@ declare global {
         isInstanceAdmin?: boolean;
         keyId?: string;
         runId?: string;
-        source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "none";
+        source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "cloud_tenant" | "none";
       };
     }
   }

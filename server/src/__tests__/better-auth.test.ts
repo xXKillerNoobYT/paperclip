@@ -2,16 +2,29 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
 import {
+  buildBetterAuthSessionOptions,
   buildBetterAuthAdvancedOptions,
+  DEFAULT_AUTH_SESSION_EXPIRES_IN_SECONDS,
+  DEFAULT_AUTH_SESSION_FRESH_AGE_SECONDS,
+  DEFAULT_AUTH_SESSION_UPDATE_AGE_SECONDS,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
 } from "../auth/better-auth.js";
 
 const ORIGINAL_INSTANCE_ID = process.env.PAPERCLIP_INSTANCE_ID;
+const ORIGINAL_SESSION_EXPIRES_IN = process.env.PAPERCLIP_AUTH_SESSION_EXPIRES_IN_SECONDS;
+const ORIGINAL_SESSION_UPDATE_AGE = process.env.PAPERCLIP_AUTH_SESSION_UPDATE_AGE_SECONDS;
+const ORIGINAL_SESSION_FRESH_AGE = process.env.PAPERCLIP_AUTH_SESSION_FRESH_AGE_SECONDS;
 
 afterEach(() => {
   if (ORIGINAL_INSTANCE_ID === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
   else process.env.PAPERCLIP_INSTANCE_ID = ORIGINAL_INSTANCE_ID;
+  if (ORIGINAL_SESSION_EXPIRES_IN === undefined) delete process.env.PAPERCLIP_AUTH_SESSION_EXPIRES_IN_SECONDS;
+  else process.env.PAPERCLIP_AUTH_SESSION_EXPIRES_IN_SECONDS = ORIGINAL_SESSION_EXPIRES_IN;
+  if (ORIGINAL_SESSION_UPDATE_AGE === undefined) delete process.env.PAPERCLIP_AUTH_SESSION_UPDATE_AGE_SECONDS;
+  else process.env.PAPERCLIP_AUTH_SESSION_UPDATE_AGE_SECONDS = ORIGINAL_SESSION_UPDATE_AGE;
+  if (ORIGINAL_SESSION_FRESH_AGE === undefined) delete process.env.PAPERCLIP_AUTH_SESSION_FRESH_AGE_SECONDS;
+  else process.env.PAPERCLIP_AUTH_SESSION_FRESH_AGE_SECONDS = ORIGINAL_SESSION_FRESH_AGE;
 });
 
 describe("Better Auth cookie scoping", () => {
@@ -39,6 +52,26 @@ describe("Better Auth cookie scoping", () => {
     expect(buildBetterAuthAdvancedOptions({ disableSecureCookies: true })).toEqual({
       cookiePrefix: "paperclip-pap-worktree",
       useSecureCookies: false,
+    });
+  });
+
+  it("codifies the default session timeout and refresh policy", () => {
+    expect(buildBetterAuthSessionOptions()).toEqual({
+      expiresIn: DEFAULT_AUTH_SESSION_EXPIRES_IN_SECONDS,
+      updateAge: DEFAULT_AUTH_SESSION_UPDATE_AGE_SECONDS,
+      freshAge: DEFAULT_AUTH_SESSION_FRESH_AGE_SECONDS,
+    });
+  });
+
+  it("allows authenticated session lifetimes to be tuned with positive integer env vars", () => {
+    process.env.PAPERCLIP_AUTH_SESSION_EXPIRES_IN_SECONDS = "3600";
+    process.env.PAPERCLIP_AUTH_SESSION_UPDATE_AGE_SECONDS = "300";
+    process.env.PAPERCLIP_AUTH_SESSION_FRESH_AGE_SECONDS = "60";
+
+    expect(buildBetterAuthSessionOptions()).toEqual({
+      expiresIn: 3600,
+      updateAge: 300,
+      freshAge: 60,
     });
   });
 

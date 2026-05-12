@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import pino from "pino";
 import { pinoHttp } from "pino-http";
 import { readConfigFile } from "../config-file.js";
@@ -47,6 +48,13 @@ export const logger = pino({
 
 export const httpLogger = pinoHttp({
   logger,
+  genReqId(req, res) {
+    const correlationId = (req as any).correlationId ?? req.headers["x-correlation-id"] ?? req.headers["x-request-id"] ?? randomUUID();
+    const value = Array.isArray(correlationId) ? correlationId[0] : correlationId;
+    (req as any).correlationId = value;
+    res.setHeader("x-correlation-id", value);
+    return value;
+  },
   customLogLevel(_req, res, err) {
     if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
       return "silent";
@@ -64,10 +72,12 @@ export const httpLogger = pinoHttp({
     return `${req.method} ${req.url} ${res.statusCode} — ${errMsg}`;
   },
   customProps(req, res) {
+    const baseProps = (req as any).correlationId ? { correlationId: (req as any).correlationId } : {};
     if (res.statusCode >= 400) {
       const ctx = (res as any).__errorContext;
       if (ctx) {
         return {
+          ...baseProps,
           errorContext: ctx.error,
           reqBody: ctx.reqBody,
           reqParams: ctx.reqParams,
@@ -88,8 +98,8 @@ export const httpLogger = pinoHttp({
       if ((req as any).route?.path) {
         props.routePath = (req as any).route.path;
       }
-      return props;
+      return { ...baseProps, ...props };
     }
-    return {};
+    return baseProps;
   },
 });

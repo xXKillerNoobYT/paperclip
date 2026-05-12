@@ -60,7 +60,7 @@ export const pluginJobs = pgTable(
  *
  * Each row is created when a job run begins and updated when it completes.
  * Rows are never modified after `status` reaches a terminal value
- * (`succeeded` | `failed` | `cancelled`).
+ * (`succeeded` | `failed` | `dead_letter` | `cancelled`).
  *
  * Trigger values:
  * - `scheduled` — fired automatically by the cron/interval scheduler
@@ -84,9 +84,11 @@ export const pluginJobRuns = pgTable(
     trigger: text("trigger").$type<PluginJobRunTrigger>().notNull(),
     /** Current lifecycle state of this run. */
     status: text("status").$type<PluginJobRunStatus>().notNull().default("pending"),
+    /** Stable client-supplied key for durable duplicate submit reuse. */
+    idempotencyKey: text("idempotency_key"),
     /** Wall-clock duration in milliseconds. Null until the run finishes. */
     durationMs: integer("duration_ms"),
-    /** Error message if `status === "failed"`. */
+    /** Error message if the run failed or landed in dead-letter handling. */
     error: text("error"),
     /** Ordered list of log lines emitted during this run. */
     logs: jsonb("logs").$type<string[]>().notNull().default([]),
@@ -98,5 +100,10 @@ export const pluginJobRuns = pgTable(
     jobIdx: index("plugin_job_runs_job_idx").on(table.jobId),
     pluginIdx: index("plugin_job_runs_plugin_idx").on(table.pluginId),
     statusIdx: index("plugin_job_runs_status_idx").on(table.status),
+    idempotencyIdx: uniqueIndex("plugin_job_runs_job_trigger_idempotency_idx").on(
+      table.jobId,
+      table.trigger,
+      table.idempotencyKey,
+    ),
   }),
 );

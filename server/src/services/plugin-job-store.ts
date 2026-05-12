@@ -62,6 +62,8 @@ export interface CreateJobRunInput {
   pluginId: string;
   /** What triggered this run. */
   trigger: PluginJobRunTrigger;
+  /** Stable client-supplied key for durable duplicate submit reuse. */
+  idempotencyKey?: string | null;
 }
 
 /**
@@ -113,6 +115,24 @@ export function pluginJobStore(db: Db) {
     if (rows.length === 0) {
       throw notFound(`Plugin not found: ${pluginId}`);
     }
+  }
+
+  async function findRunByIdempotencyKey(
+    jobId: string,
+    trigger: PluginJobRunTrigger,
+    idempotencyKey: string,
+  ): Promise<(typeof pluginJobRuns.$inferSelect) | null> {
+    const rows = await db
+      .select()
+      .from(pluginJobRuns)
+      .where(
+        and(
+          eq(pluginJobRuns.jobId, jobId),
+          eq(pluginJobRuns.trigger, trigger),
+          eq(pluginJobRuns.idempotencyKey, idempotencyKey),
+        ),
+      );
+    return rows[0] ?? null;
   }
 
   // -----------------------------------------------------------------------
@@ -357,11 +377,65 @@ export function pluginJobStore(db: Db) {
           jobId: input.jobId,
           pluginId: input.pluginId,
           trigger: input.trigger,
+          idempotencyKey: input.idempotencyKey ?? null,
           status: "queued",
         })
         .returning();
 
       return rows[0]!;
+    },
+
+    /**
+     * Create a run using a durable idempotency key, or return the existing run
+     * created by the same job/trigger/key submit.
+     */
+    async createRunIdempotently(
+      input: CreateJobRunInput & { idempotencyKey: string },
+    ): Promise<{
+      run: typeof pluginJobRuns.$inferSelect;
+      created: boolean;
+    }> {
+      const existing = await findRunByIdempotencyKey(
+        input.jobId,
+        input.trigger,
+        input.idempotencyKey,
+      );
+      if (existing) {
+        return { run: existing, created: false };
+      }
+
+      const inserted = await db
+        .insert(pluginJobRuns)
+        .values({
+          jobId: input.jobId,
+          pluginId: input.pluginId,
+          trigger: input.trigger,
+          idempotencyKey: input.idempotencyKey,
+          status: "queued",
+        })
+        .onConflictDoNothing({
+          target: [
+            pluginJobRuns.jobId,
+            pluginJobRuns.trigger,
+            pluginJobRuns.idempotencyKey,
+          ],
+        })
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (inserted) {
+        return { run: inserted, created: true };
+      }
+
+      const raced = await findRunByIdempotencyKey(
+        input.jobId,
+        input.trigger,
+        input.idempotencyKey,
+      );
+      if (!raced) {
+        throw new Error("Failed to reuse plugin job idempotency result");
+      }
+      return { run: raced, created: false };
     },
 
     /**
@@ -415,6 +489,17 @@ export function pluginJobStore(db: Db) {
         .from(pluginJobRuns)
         .where(eq(pluginJobRuns.id, runId));
       return rows[0] ?? null;
+    },
+
+    /**
+     * Find the durable result for a client-supplied idempotency key.
+     */
+    async findRunByIdempotencyKey(
+      jobId: string,
+      trigger: PluginJobRunTrigger,
+      idempotencyKey: string,
+    ): Promise<(typeof pluginJobRuns.$inferSelect) | null> {
+      return findRunByIdempotencyKey(jobId, trigger, idempotencyKey);
     },
 
     /**
