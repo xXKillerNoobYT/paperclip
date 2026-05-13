@@ -191,6 +191,27 @@ describe("issue execution policy routes", () => {
       missing: "review_path",
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId: "company-1",
+        actorType: "agent",
+        actorId: "33333333-3333-4333-8333-333333333333",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        runId: "run-1",
+        action: "issue.in_review_guardrail_rejected",
+        entityType: "issue",
+        entityId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        details: expect.objectContaining({
+          code: "invalid_issue_disposition",
+          state: "in_review_without_action_path",
+          previousStatus: "todo",
+          requestedStatus: "in_review",
+          assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+          identifier: "PAP-1003",
+        }),
+      }),
+    );
   });
 
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {

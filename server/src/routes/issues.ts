@@ -867,18 +867,20 @@ export function issueRoutes(
     existing: {
       id: string;
       companyId: string;
+      identifier?: string | null;
       status: string;
+      assigneeAgentId?: string | null;
       assigneeUserId?: string | null;
       executionState?: unknown;
       monitorNextCheckAt?: Date | null;
     };
     updateFields: Record<string, unknown>;
-    actorType: string;
+    actor: ReturnType<typeof getActorInfo>;
   }) {
     const nextStatus = typeof input.updateFields.status === "string"
       ? input.updateFields.status
       : input.existing.status;
-    if (input.actorType !== "agent" || input.existing.status === "in_review" || nextStatus !== "in_review") return;
+    if (input.actor.actorType !== "agent" || input.existing.status === "in_review" || nextStatus !== "in_review") return;
 
     const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
       ? input.existing.assigneeUserId
@@ -902,6 +904,29 @@ export function issueRoutes(
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
+
+    try {
+      await logActivity(db, {
+        companyId: input.existing.companyId,
+        actorType: input.actor.actorType,
+        actorId: input.actor.actorId,
+        agentId: input.actor.agentId,
+        runId: input.actor.runId,
+        action: "issue.in_review_guardrail_rejected",
+        entityType: "issue",
+        entityId: input.existing.id,
+        details: {
+          code: "invalid_issue_disposition",
+          state: "in_review_without_action_path",
+          previousStatus: input.existing.status,
+          requestedStatus: nextStatus,
+          assigneeAgentId: input.existing.assigneeAgentId ?? null,
+          identifier: input.existing.identifier ?? null,
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: input.existing.id }, "failed to log in-review guardrail rejection");
+    }
 
     throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
       code: "invalid_issue_disposition",
@@ -2740,7 +2765,7 @@ export function issueRoutes(
     await assertAgentInReviewReviewPath({
       existing,
       updateFields,
-      actorType: req.actor.type,
+      actor,
     });
 
     const nextAssigneeAgentId =
