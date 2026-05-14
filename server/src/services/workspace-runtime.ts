@@ -67,6 +67,50 @@ export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   worktreePath: string | null;
   warnings: string[];
   created: boolean;
+  branchSync: ExecutionWorkspaceBranchSyncResult | null;
+}
+
+export type ExecutionWorkspaceBranchSyncStage = "start" | "review";
+
+export interface ExecutionWorkspaceBranchSyncResult {
+  stage: ExecutionWorkspaceBranchSyncStage;
+  status: "not_configured" | "synced" | "blocked" | "manual_push_required" | "pushed";
+  branchName: string | null;
+  baseRef: string | null;
+  remoteName: string | null;
+  aheadCount: number | null;
+  behindCount: number | null;
+  dirtyEntryCount: number;
+  untrackedEntryCount: number;
+  action: "none" | "fetch" | "rebase" | "merge";
+  push: {
+    status: "not_attempted" | "pushed" | "manual_required" | "failed";
+    remoteName: string | null;
+    branchName: string | null;
+    command: string | null;
+    reason: string | null;
+  };
+  pullRequest: {
+    status: "not_configured" | "ready" | "manual_required";
+    title: string | null;
+    reason: string | null;
+  };
+  blocker: {
+    code: "dirty_worktree" | "sync_conflict" | "missing_remote" | "git_error";
+    owner: "implementation_owner" | "operator";
+    action: string;
+    details: string;
+  } | null;
+}
+
+export class ExecutionWorkspaceBranchSyncError extends Error {
+  readonly sync: ExecutionWorkspaceBranchSyncResult;
+
+  constructor(message: string, sync: ExecutionWorkspaceBranchSyncResult) {
+    super(message);
+    this.name = "ExecutionWorkspaceBranchSyncError";
+    this.sync = sync;
+  }
 }
 
 export interface RuntimeServiceRef {
@@ -529,6 +573,292 @@ function gitErrorIncludes(error: unknown, needle: string) {
   return message.toLowerCase().includes(needle.toLowerCase());
 }
 
+function parseBooleanPolicy(value: unknown, fallback: boolean) {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function parseBranchSyncStrategy(policy: Record<string, unknown>): "rebase" | "merge" {
+  const strategy = asString(policy.syncStrategy ?? policy.updateStrategy, "").toLowerCase();
+  if (strategy === "merge" || policy.mergeOnly === true) return "merge";
+  return "rebase";
+}
+
+function parseRemoteFromRef(ref: string | null): string | null {
+  if (!ref) return null;
+  if (!ref.includes("/")) return null;
+  const [remote] = ref.split("/", 1);
+  if (!remote || remote === "HEAD" || remote === "." || remote.startsWith("refs")) return null;
+  return remote;
+}
+
+function buildBranchSyncResult(input: {
+  stage: ExecutionWorkspaceBranchSyncStage;
+  status: ExecutionWorkspaceBranchSyncResult["status"];
+  branchName: string | null;
+  baseRef: string | null;
+  remoteName: string | null;
+  aheadCount?: number | null;
+  behindCount?: number | null;
+  dirtyEntryCount?: number;
+  untrackedEntryCount?: number;
+  action?: ExecutionWorkspaceBranchSyncResult["action"];
+  push?: Partial<ExecutionWorkspaceBranchSyncResult["push"]>;
+  pullRequest?: Partial<ExecutionWorkspaceBranchSyncResult["pullRequest"]>;
+  blocker?: ExecutionWorkspaceBranchSyncResult["blocker"];
+}): ExecutionWorkspaceBranchSyncResult {
+  return {
+    stage: input.stage,
+    status: input.status,
+    branchName: input.branchName,
+    baseRef: input.baseRef,
+    remoteName: input.remoteName,
+    aheadCount: input.aheadCount ?? null,
+    behindCount: input.behindCount ?? null,
+    dirtyEntryCount: input.dirtyEntryCount ?? 0,
+    untrackedEntryCount: input.untrackedEntryCount ?? 0,
+    action: input.action ?? "none",
+    push: {
+      status: input.push?.status ?? "not_attempted",
+      remoteName: input.push?.remoteName ?? null,
+      branchName: input.push?.branchName ?? null,
+      command: input.push?.command ?? null,
+      reason: input.push?.reason ?? null,
+    },
+    pullRequest: {
+      status: input.pullRequest?.status ?? "not_configured",
+      title: input.pullRequest?.title ?? null,
+      reason: input.pullRequest?.reason ?? null,
+    },
+    blocker: input.blocker ?? null,
+  };
+}
+
+function parseGitStatusCounts(raw: string) {
+  let dirtyEntryCount = 0;
+  let untrackedEntryCount = 0;
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    if (line.startsWith("?? ")) untrackedEntryCount += 1;
+    else dirtyEntryCount += 1;
+  }
+  return { dirtyEntryCount, untrackedEntryCount };
+}
+
+async function readGitAheadBehind(cwd: string, baseRef: string | null) {
+  if (!baseRef) return { aheadCount: null, behindCount: null };
+  const output = await runGit(["rev-list", "--left-right", "--count", `${baseRef}...HEAD`], cwd).catch(() => null);
+  if (!output) return { aheadCount: null, behindCount: null };
+  const [behindRaw, aheadRaw] = output.split(/\s+/);
+  const behindCount = behindRaw ? Number.parseInt(behindRaw, 10) : 0;
+  const aheadCount = aheadRaw ? Number.parseInt(aheadRaw, 10) : 0;
+  return {
+    aheadCount: Number.isFinite(aheadCount) ? aheadCount : null,
+    behindCount: Number.isFinite(behindCount) ? behindCount : null,
+  };
+}
+
+async function recordBranchGitOperation(
+  recorder: WorkspaceOperationRecorder | null | undefined,
+  input: {
+    args: string[];
+    cwd: string;
+    metadata?: Record<string, unknown> | null;
+    successMessage?: string | null;
+    failureLabel?: string | null;
+  },
+) {
+  return recordGitOperation(recorder, {
+    phase: "worktree_prepare",
+    args: input.args,
+    cwd: input.cwd,
+    metadata: {
+      branchLifecycle: true,
+      ...(input.metadata ?? {}),
+    },
+    successMessage: input.successMessage,
+    failureLabel: input.failureLabel,
+  });
+}
+
+function renderPullRequestTitle(template: string | null, input: {
+  issue: ExecutionWorkspaceIssueRef | null;
+  branchName: string;
+}) {
+  if (!template) return null;
+  return renderWorkspaceTemplate(template, {
+    issue: input.issue,
+    agent: { id: null, name: "", companyId: "" },
+    projectId: null,
+    repoRef: input.branchName,
+  });
+}
+
+export async function synchronizeExecutionWorkspaceBranch(input: {
+  cwd: string;
+  branchName: string | null;
+  baseRef: string | null;
+  branchPolicy?: Record<string, unknown> | null;
+  pullRequestPolicy?: Record<string, unknown> | null;
+  stage?: ExecutionWorkspaceBranchSyncStage;
+  issue?: ExecutionWorkspaceIssueRef | null;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<ExecutionWorkspaceBranchSyncResult | null> {
+  const stage = input.stage ?? "start";
+  const branchPolicy = parseObject(input.branchPolicy);
+  const pullRequestPolicy = parseObject(input.pullRequestPolicy);
+  const shouldSync =
+    stage === "review"
+      ? parseBooleanPolicy(branchPolicy.syncBeforeReview, false)
+      : parseBooleanPolicy(branchPolicy.syncBeforeStart, false);
+  const shouldPush = stage === "review" && Object.keys(pullRequestPolicy).length > 0;
+
+  if (!shouldSync && !shouldPush) {
+    return null;
+  }
+
+  const baseRef = input.baseRef ?? null;
+  const remoteName = parseRemoteFromRef(baseRef);
+  const statusCounts = parseGitStatusCounts(await runGit(["status", "--porcelain"], input.cwd));
+  const aheadBehind = await readGitAheadBehind(input.cwd, baseRef);
+
+  if (statusCounts.dirtyEntryCount > 0 || statusCounts.untrackedEntryCount > 0) {
+    const sync = buildBranchSyncResult({
+      stage,
+      status: "blocked",
+      branchName: input.branchName,
+      baseRef,
+      remoteName,
+      ...statusCounts,
+      ...aheadBehind,
+      blocker: {
+        code: "dirty_worktree",
+        owner: "implementation_owner",
+        action: "Commit, stash, or remove local changes before Paperclip syncs this workspace.",
+        details: `Workspace has ${statusCounts.dirtyEntryCount} tracked change(s) and ${statusCounts.untrackedEntryCount} untracked file(s).`,
+      },
+    });
+    throw new ExecutionWorkspaceBranchSyncError(sync.blocker?.details ?? "Workspace has dirty changes.", sync);
+  }
+
+  let action: ExecutionWorkspaceBranchSyncResult["action"] = "none";
+  if (shouldSync) {
+    if (remoteName) {
+      await recordBranchGitOperation(input.recorder, {
+        args: ["fetch", remoteName],
+        cwd: input.cwd,
+        metadata: { branchName: input.branchName, baseRef, remoteName, stage },
+        successMessage: `Fetched ${remoteName} before branch lifecycle sync\n`,
+        failureLabel: `git fetch ${remoteName}`,
+      });
+      action = "fetch";
+    }
+
+    const latestAheadBehind = await readGitAheadBehind(input.cwd, baseRef);
+    if ((latestAheadBehind.behindCount ?? 0) > 0) {
+      const strategy = parseBranchSyncStrategy(branchPolicy);
+      action = strategy;
+      try {
+        await recordBranchGitOperation(input.recorder, {
+          args: strategy === "merge" ? ["merge", "--no-edit", baseRef ?? "HEAD"] : ["rebase", baseRef ?? "HEAD"],
+          cwd: input.cwd,
+          metadata: { branchName: input.branchName, baseRef, remoteName, stage, strategy },
+          successMessage: `${strategy === "merge" ? "Merged" : "Rebased"} ${input.branchName ?? "workspace"} with ${baseRef ?? "base ref"}\n`,
+          failureLabel: `git ${strategy} ${baseRef ?? "HEAD"}`,
+        });
+      } catch (error) {
+        const sync = buildBranchSyncResult({
+          stage,
+          status: "blocked",
+          branchName: input.branchName,
+          baseRef,
+          remoteName,
+          ...statusCounts,
+          ...latestAheadBehind,
+          action,
+          blocker: {
+            code: "sync_conflict",
+            owner: "implementation_owner",
+            action: `Resolve git ${strategy} conflicts in the issue workspace, then rerun the heartbeat.`,
+            details: error instanceof Error ? error.message : String(error),
+          },
+        });
+        throw new ExecutionWorkspaceBranchSyncError(sync.blocker?.details ?? "Branch sync failed.", sync);
+      }
+    }
+  }
+
+  const finalStatusCounts = parseGitStatusCounts(await runGit(["status", "--porcelain"], input.cwd));
+  const finalAheadBehind = await readGitAheadBehind(input.cwd, baseRef);
+  let push: ExecutionWorkspaceBranchSyncResult["push"] = {
+    status: "not_attempted",
+    remoteName: null,
+    branchName: null,
+    command: null,
+    reason: null,
+  };
+  let pullRequest: ExecutionWorkspaceBranchSyncResult["pullRequest"] = {
+    status: "not_configured",
+    title: null,
+    reason: null,
+  };
+
+  if (shouldPush) {
+    const remoteForPush = remoteName ?? asString(pullRequestPolicy.remote, "");
+    const branchName = input.branchName;
+    const command = remoteForPush && branchName ? `git push -u ${remoteForPush} ${branchName}` : null;
+    if (!remoteForPush || !branchName) {
+      push = {
+        status: "manual_required",
+        remoteName: remoteForPush || null,
+        branchName,
+        command,
+        reason: "No git remote or branch name is available for an automatic push.",
+      };
+    } else {
+      try {
+        await recordBranchGitOperation(input.recorder, {
+          args: ["push", "-u", remoteForPush, branchName],
+          cwd: input.cwd,
+          metadata: { branchName, baseRef, remoteName: remoteForPush, stage },
+          successMessage: `Pushed ${branchName} to ${remoteForPush}\n`,
+          failureLabel: `git push -u ${remoteForPush} ${branchName}`,
+        });
+        push = { status: "pushed", remoteName: remoteForPush, branchName, command, reason: null };
+      } catch (error) {
+        push = {
+          status: "manual_required",
+          remoteName: remoteForPush,
+          branchName,
+          command,
+          reason: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+
+    pullRequest = {
+      status: push.status === "pushed" ? "ready" : "manual_required",
+      title: renderPullRequestTitle(asString(pullRequestPolicy.titleTemplate, ""), {
+        issue: input.issue ?? null,
+        branchName: input.branchName ?? "",
+      }),
+      reason: push.status === "pushed" ? null : "Push the branch manually before opening or updating the pull request.",
+    };
+  }
+
+  return buildBranchSyncResult({
+    stage,
+    status: push.status === "manual_required" ? "manual_push_required" : push.status === "pushed" ? "pushed" : "synced",
+    branchName: input.branchName,
+    baseRef,
+    remoteName,
+    ...finalStatusCounts,
+    ...finalAheadBehind,
+    action,
+    push,
+    pullRequest,
+  });
+}
+
 type GitWorktreeListEntry = {
   worktree: string;
   branch: string | null;
@@ -588,6 +918,12 @@ async function findRegisteredGitWorktreeByBranch(repoRoot: string, branchName: s
 
 async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
+}
+
+async function detectCurrentGitBranch(cwd: string): Promise<string | null> {
+  const branch = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], cwd).catch(() => null);
+  if (!branch || branch === "HEAD") return null;
+  return branch;
 }
 
 async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
@@ -990,19 +1326,24 @@ export async function realizeExecutionWorkspace(input: {
   config: Record<string, unknown>;
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
+  branchPolicy?: Record<string, unknown> | null;
+  pullRequestPolicy?: Record<string, unknown> | null;
+  branchSyncStage?: ExecutionWorkspaceBranchSyncStage;
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<RealizedExecutionWorkspace> {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
   const strategyType = asString(rawStrategy.type, "project_primary");
   if (strategyType !== "git_worktree") {
+    const branchName = await detectCurrentGitBranch(input.base.baseCwd);
     return {
       ...input.base,
       strategy: "project_primary",
       cwd: input.base.baseCwd,
-      branchName: null,
+      branchName,
       worktreePath: null,
       warnings: [],
       created: false,
+      branchSync: null,
     };
   }
 
@@ -1060,6 +1401,16 @@ export async function realizeExecutionWorkspace(input: {
       created: false,
       recorder: input.recorder ?? null,
     });
+    const branchSync = await synchronizeExecutionWorkspaceBranch({
+      cwd: reusablePath,
+      branchName,
+      baseRef,
+      branchPolicy: input.branchPolicy,
+      pullRequestPolicy: input.pullRequestPolicy,
+      stage: input.branchSyncStage ?? "start",
+      issue: input.issue,
+      recorder: input.recorder ?? null,
+    });
     return {
       ...input.base,
       strategy: "git_worktree" as const,
@@ -1068,6 +1419,7 @@ export async function realizeExecutionWorkspace(input: {
       worktreePath: reusablePath,
       warnings: [],
       created: false,
+      branchSync,
     };
   }
 
@@ -1157,6 +1509,17 @@ export async function realizeExecutionWorkspace(input: {
     recorder: input.recorder ?? null,
   });
 
+  const branchSync = await synchronizeExecutionWorkspaceBranch({
+    cwd: worktreePath,
+    branchName,
+    baseRef,
+    branchPolicy: input.branchPolicy,
+    pullRequestPolicy: input.pullRequestPolicy,
+    stage: input.branchSyncStage ?? "start",
+    issue: input.issue,
+    recorder: input.recorder ?? null,
+  });
+
   return {
     ...input.base,
     strategy: "git_worktree",
@@ -1165,6 +1528,7 @@ export async function realizeExecutionWorkspace(input: {
     worktreePath,
     warnings: [],
     created: true,
+    branchSync,
   };
 }
 
@@ -1186,6 +1550,9 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   };
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
+  branchPolicy?: Record<string, unknown> | null;
+  pullRequestPolicy?: Record<string, unknown> | null;
+  branchSyncStage?: ExecutionWorkspaceBranchSyncStage;
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<RealizedExecutionWorkspace | null> {
   const cwd = asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim();
@@ -1205,11 +1572,22 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     worktreePath: strategy === "git_worktree" ? (input.workspace.providerRef ?? cwd) : null,
     warnings: [],
     created: false,
+    branchSync: null,
   };
   const provisionCommand = asString(input.workspace.config?.provisionCommand, "").trim();
 
   if (strategy !== "git_worktree") {
-    return realized;
+    const branchSync = await synchronizeExecutionWorkspaceBranch({
+      cwd,
+      branchName: realized.branchName,
+      baseRef: realized.repoRef,
+      branchPolicy: input.branchPolicy,
+      pullRequestPolicy: input.pullRequestPolicy,
+      stage: input.branchSyncStage ?? "start",
+      issue: input.issue,
+      recorder: input.recorder ?? null,
+    });
+    return { ...realized, branchSync };
   }
   if (await directoryExists(cwd)) {
     if (provisionCommand) {
@@ -1306,6 +1684,16 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     cwd: worktreePath,
     worktreePath,
     created,
+    branchSync: await synchronizeExecutionWorkspaceBranch({
+      cwd: worktreePath,
+      branchName,
+      baseRef: realized.repoRef,
+      branchPolicy: input.branchPolicy,
+      pullRequestPolicy: input.pullRequestPolicy,
+      stage: input.branchSyncStage ?? "start",
+      issue: input.issue,
+      recorder: input.recorder ?? null,
+    }),
   };
 }
 
@@ -2794,6 +3182,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           worktreePath: null,
           warnings: [],
           created: false,
+          branchSync: null,
         },
         config: {
           workspaceRuntime: runtimeConfig.workspaceRuntime,
@@ -2848,6 +3237,7 @@ export async function restartDesiredRuntimeServicesOnStartup(db: Db) {
           worktreePath: row.strategyType === "git_worktree" ? row.cwd : null,
           warnings: [],
           created: false,
+          branchSync: null,
         },
         executionWorkspaceId: row.id,
         config: {

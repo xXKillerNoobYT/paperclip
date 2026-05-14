@@ -84,9 +84,11 @@ import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
   ensureRuntimeServicesForRun,
+  ExecutionWorkspaceBranchSyncError,
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  synchronizeExecutionWorkspaceBranch,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
@@ -577,6 +579,7 @@ export function buildRealizedExecutionWorkspaceFromPersisted(input: {
     worktreePath: strategy === "git_worktree" ? (readNonEmptyString(input.workspace.providerRef) ?? cwd) : null,
     warnings: [],
     created: false,
+    branchSync: null,
   };
 }
 
@@ -7076,8 +7079,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           base: executionWorkspaceBase,
           workspace: existingExecutionWorkspace,
         })
-      : null;
-    const executionWorkspace = reusedExecutionWorkspace ?? await realizeExecutionWorkspace({
+        : null;
+    let executionWorkspace: RealizedExecutionWorkspace;
+    try {
+      executionWorkspace = reusedExecutionWorkspace ?? await realizeExecutionWorkspace({
           base: executionWorkspaceBase,
           config: runtimeConfig,
           issue: issueRef,
@@ -7086,8 +7091,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          branchPolicy: projectExecutionWorkspacePolicy?.branchPolicy ?? null,
+          pullRequestPolicy: projectExecutionWorkspacePolicy?.pullRequestPolicy ?? null,
+          branchSyncStage: issueRef?.status === "in_review" ? "review" : "start",
           recorder: workspaceOperationRecorder,
         });
+      if (reusedExecutionWorkspace && reusedExecutionWorkspace.strategy === "git_worktree") {
+        executionWorkspace = {
+          ...reusedExecutionWorkspace,
+          branchSync: await synchronizeExecutionWorkspaceBranch({
+            cwd: reusedExecutionWorkspace.cwd,
+            branchName: reusedExecutionWorkspace.branchName,
+            baseRef: reusedExecutionWorkspace.repoRef,
+            branchPolicy: projectExecutionWorkspacePolicy?.branchPolicy ?? null,
+            pullRequestPolicy: projectExecutionWorkspacePolicy?.pullRequestPolicy ?? null,
+            stage: issueRef?.status === "in_review" ? "review" : "start",
+            issue: issueRef,
+            recorder: workspaceOperationRecorder,
+          }),
+        };
+      }
+    } catch (error) {
+      if (error instanceof ExecutionWorkspaceBranchSyncError && issueId) {
+        await issuesSvc.update(issueId, {
+          status: "blocked",
+          actorAgentId: agent.id,
+        });
+        const blocker = error.sync.blocker;
+        await issuesSvc.addComment(
+          issueId,
+          [
+            "Blocked by branch lifecycle sync.",
+            "",
+            `- Branch: ${error.sync.branchName ?? "unknown"}`,
+            `- Base ref: ${error.sync.baseRef ?? "unknown"}`,
+            `- Status: ${error.sync.status}`,
+            `- Owner/action: ${blocker?.owner ?? "implementation_owner"} — ${blocker?.action ?? "Resolve the branch sync blocker."}`,
+            `- Details: ${blocker?.details ?? error.message}`,
+          ].join("\n"),
+          { agentId: agent.id, runId: run.id },
+        );
+      }
+      throw error;
+    }
     const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
     const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
     let persistedExecutionWorkspace = null;
@@ -7097,7 +7143,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       createdByRuntime: executionWorkspace.created,
       configSnapshot,
       shouldReuseExisting,
-    });
+    }) ?? {};
+    if (executionWorkspace.branchSync) {
+      nextExecutionWorkspaceMetadata.branchSync = executionWorkspace.branchSync;
+    }
     try {
       persistedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
         ? await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
@@ -7326,6 +7375,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       repoRef: executionWorkspace.repoRef,
       branchName: executionWorkspace.branchName,
       worktreePath: executionWorkspace.worktreePath,
+      branchSync: executionWorkspace.branchSync,
       realization: workspaceRealization,
       agentHome: await (async () => {
         const home = resolveDefaultAgentWorkspaceDir(agent.id);

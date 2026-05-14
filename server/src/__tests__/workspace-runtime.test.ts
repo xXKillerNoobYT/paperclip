@@ -35,6 +35,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
   startRuntimeServicesForWorkspaceControl,
   stopRuntimeServicesForExecutionWorkspace,
+  synchronizeExecutionWorkspaceBranch,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
 import { writeLocalServiceRegistryRecord } from "../services/local-service-supervisor.ts";
@@ -92,6 +93,7 @@ function buildWorkspace(cwd: string): RealizedExecutionWorkspace {
     worktreePath: null,
     warnings: [],
     created: false,
+    branchSync: null,
   };
 }
 
@@ -304,6 +306,37 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
 });
 
 describe("realizeExecutionWorkspace", () => {
+  it("detects the current git branch for project-primary workspaces", async () => {
+    const repoRoot = await createTempRepo("feature/current-branch");
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {},
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Use primary workspace",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(workspace.strategy).toBe("project_primary");
+    expect(workspace.created).toBe(false);
+    expect(workspace.branchName).toBe("feature/current-branch");
+    expect(workspace.cwd).toBe(repoRoot);
+  });
+
   it("creates and reuses a git worktree for an issue-scoped branch", async () => {
     const repoRoot = await createTempRepo();
 
@@ -1518,6 +1551,136 @@ describe("realizeExecutionWorkspace", () => {
     });
     expect(provisionOperation?.result.stdout).toContain("[output truncated to last");
     expect(provisionOperation?.result.stdout?.length ?? 0).toBeLessThan(300000);
+  }, 10_000);
+
+  it("syncs a clean worktree branch onto the configured base ref", async () => {
+    const repoRoot = await createTempRepo();
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-branch-sync-remote-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "-u", "origin", "main"]);
+
+    const workspacePath = path.join(path.dirname(repoRoot), `paperclip-sync-${randomUUID()}`);
+    await runGit(repoRoot, ["worktree", "add", "-b", "PAP-1191-clean-sync", workspacePath, "HEAD"]);
+    await fs.writeFile(path.join(repoRoot, "base.txt"), "new base\n", "utf8");
+    await runGit(repoRoot, ["add", "base.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Advance base"]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+
+    const result = await synchronizeExecutionWorkspaceBranch({
+      cwd: workspacePath,
+      branchName: "PAP-1191-clean-sync",
+      baseRef: "origin/main",
+      branchPolicy: { syncBeforeStart: true },
+      stage: "start",
+    });
+
+    expect(result).toMatchObject({
+      status: "synced",
+      branchName: "PAP-1191-clean-sync",
+      baseRef: "origin/main",
+      behindCount: 0,
+      blocker: null,
+    });
+    await expect(fs.readFile(path.join(workspacePath, "base.txt"), "utf8")).resolves.toBe("new base\n");
+  }, 10_000);
+
+  it("refuses to sync when the worktree has dirty files", async () => {
+    const repoRoot = await createTempRepo();
+    const workspacePath = path.join(path.dirname(repoRoot), `paperclip-dirty-${randomUUID()}`);
+    await runGit(repoRoot, ["worktree", "add", "-b", "PAP-1191-dirty", workspacePath, "HEAD"]);
+    await fs.writeFile(path.join(workspacePath, "dirty.txt"), "not committed\n", "utf8");
+
+    await expect(synchronizeExecutionWorkspaceBranch({
+      cwd: workspacePath,
+      branchName: "PAP-1191-dirty",
+      baseRef: "main",
+      branchPolicy: { syncBeforeStart: true },
+      stage: "start",
+    })).rejects.toMatchObject({
+      name: "ExecutionWorkspaceBranchSyncError",
+      sync: {
+        status: "blocked",
+        blocker: {
+          code: "dirty_worktree",
+          owner: "implementation_owner",
+        },
+      },
+    });
+  });
+
+  it("reports a structured blocker when rebase conflicts", async () => {
+    const repoRoot = await createTempRepo();
+    const workspacePath = path.join(path.dirname(repoRoot), `paperclip-conflict-${randomUUID()}`);
+    await fs.writeFile(path.join(repoRoot, "conflict.txt"), "base\n", "utf8");
+    await runGit(repoRoot, ["add", "conflict.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add conflict base"]);
+    await runGit(repoRoot, ["worktree", "add", "-b", "PAP-1191-conflict", workspacePath, "HEAD"]);
+
+    await fs.writeFile(path.join(workspacePath, "conflict.txt"), "branch\n", "utf8");
+    await runGit(workspacePath, ["add", "conflict.txt"]);
+    await runGit(workspacePath, ["commit", "-m", "Branch changes conflict file"]);
+    await fs.writeFile(path.join(repoRoot, "conflict.txt"), "main\n", "utf8");
+    await runGit(repoRoot, ["add", "conflict.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Main changes conflict file"]);
+
+    await expect(synchronizeExecutionWorkspaceBranch({
+      cwd: workspacePath,
+      branchName: "PAP-1191-conflict",
+      baseRef: "main",
+      branchPolicy: { syncBeforeStart: true },
+      stage: "start",
+    })).rejects.toMatchObject({
+      name: "ExecutionWorkspaceBranchSyncError",
+      sync: {
+        status: "blocked",
+        action: "rebase",
+        blocker: {
+          code: "sync_conflict",
+          owner: "implementation_owner",
+        },
+      },
+    });
+
+    await runGit(workspacePath, ["rebase", "--abort"]);
+  }, 10_000);
+
+  it("reports manual push and PR metadata when no remote is available", async () => {
+    const repoRoot = await createTempRepo();
+    const workspacePath = path.join(path.dirname(repoRoot), `paperclip-manual-push-${randomUUID()}`);
+    await runGit(repoRoot, ["worktree", "add", "-b", "PAP-1191-manual-push", workspacePath, "HEAD"]);
+    await fs.writeFile(path.join(workspacePath, "feature.txt"), "feature\n", "utf8");
+    await runGit(workspacePath, ["add", "feature.txt"]);
+    await runGit(workspacePath, ["commit", "-m", "Add feature"]);
+
+    const result = await synchronizeExecutionWorkspaceBranch({
+      cwd: workspacePath,
+      branchName: "PAP-1191-manual-push",
+      baseRef: "main",
+      branchPolicy: { syncBeforeReview: true },
+      pullRequestPolicy: {
+        mode: "draft_until_verified",
+        titleTemplate: "{{issue.identifier}}: {{issue.title}}",
+      },
+      stage: "review",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1191",
+        title: "Manual push reporting",
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "manual_push_required",
+      push: {
+        status: "manual_required",
+        command: null,
+      },
+      pullRequest: {
+        status: "manual_required",
+        title: "PAP-1191: Manual push reporting",
+      },
+    });
   }, 10_000);
 
   it("reuses an existing branch without resetting it when recreating a missing worktree", async () => {
