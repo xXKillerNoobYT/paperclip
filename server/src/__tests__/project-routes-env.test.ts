@@ -219,4 +219,58 @@ describe("project env routes", () => {
       }),
     );
   });
+
+  it("accepts typed workspace policy fields on update", async () => {
+    const executionWorkspacePolicy = {
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      workspaceStrategy: {
+        type: "git_worktree",
+        baseRef: "origin/main",
+        branchTemplate: "{{issue.identifier}}-{{slug}}",
+      },
+      branchPolicy: {
+        syncBeforeStart: true,
+        syncBeforeReview: true,
+        deleteAfterMerge: false,
+      },
+      pullRequestPolicy: {
+        mode: "draft_until_verified",
+        titleTemplate: "{{issue.identifier}}: {{issue.title}}",
+      },
+      validationCommand: "./scripts/verify-mac.sh",
+      validationPlatform: "mac",
+    };
+    mockProjectService.getById.mockResolvedValue(buildProject());
+    mockProjectService.update.mockResolvedValue(buildProject({ executionWorkspacePolicy }));
+
+    const app = await createApp();
+    const res = await request(app)
+      .patch("/api/projects/project-1")
+      .send({ executionWorkspacePolicy });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockProjectService.update).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ executionWorkspacePolicy }),
+    );
+  });
+
+  it("rejects invalid typed workspace policy enum values", async () => {
+    const app = await createApp();
+    const res = await request(app)
+      .patch("/api/projects/project-1")
+      .send({
+        executionWorkspacePolicy: {
+          enabled: true,
+          pullRequestPolicy: {
+            mode: "open_whenever",
+          },
+          validationPlatform: "ios",
+        },
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockProjectService.update).not.toHaveBeenCalled();
+  });
 });

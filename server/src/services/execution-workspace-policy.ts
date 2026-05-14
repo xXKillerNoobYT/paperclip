@@ -1,5 +1,8 @@
 import type {
+  ExecutionWorkspaceBranchPolicy,
   ExecutionWorkspaceMode,
+  ExecutionWorkspacePullRequestPolicy,
+  ExecutionWorkspaceValidationPlatform,
   ExecutionWorkspaceStrategy,
   IssueExecutionWorkspaceSettings,
   ProjectExecutionWorkspaceDefaultMode,
@@ -30,15 +33,54 @@ function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrate
   };
 }
 
+function parseBranchPolicy(raw: unknown): ExecutionWorkspaceBranchPolicy | null {
+  const parsed = parseObject(raw);
+  if (Object.keys(parsed).length === 0) return null;
+  return {
+    ...parsed,
+    ...(typeof parsed.syncBeforeStart === "boolean" ? { syncBeforeStart: parsed.syncBeforeStart } : {}),
+    ...(typeof parsed.syncBeforeReview === "boolean" ? { syncBeforeReview: parsed.syncBeforeReview } : {}),
+    ...(typeof parsed.deleteAfterMerge === "boolean" ? { deleteAfterMerge: parsed.deleteAfterMerge } : {}),
+    ...(parsed.syncStrategy === "rebase" || parsed.syncStrategy === "merge" ? { syncStrategy: parsed.syncStrategy } : {}),
+  };
+}
+
+function parsePullRequestPolicy(raw: unknown): ExecutionWorkspacePullRequestPolicy | null {
+  const parsed = parseObject(raw);
+  if (Object.keys(parsed).length === 0) return null;
+  const mode = asString(parsed.mode, "");
+  return {
+    ...parsed,
+    ...(mode === "none" || mode === "draft_until_verified" || mode === "ready_immediately" ? { mode } : {}),
+    ...(typeof parsed.titleTemplate === "string" ? { titleTemplate: parsed.titleTemplate } : {}),
+    ...(typeof parsed.remote === "string" ? { remote: parsed.remote } : {}),
+  };
+}
+
+function parseValidationPlatform(raw: unknown): ExecutionWorkspaceValidationPlatform | null {
+  return raw === "mac" || raw === "web" || raw === "linux" || raw === "windows" ? raw : null;
+}
+
 export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecutionWorkspacePolicy | null {
   const parsed = parseObject(raw);
   if (Object.keys(parsed).length === 0) return null;
   const enabled = typeof parsed.enabled === "boolean" ? parsed.enabled : false;
   const workspaceStrategy = parseExecutionWorkspaceStrategy(parsed.workspaceStrategy);
+  const runtimePolicy = parseObject(parsed.runtimePolicy);
+  const branchPolicy = parseBranchPolicy(parsed.branchPolicy);
+  const pullRequestPolicy = parsePullRequestPolicy(parsed.pullRequestPolicy);
   const defaultMode = asString(parsed.defaultMode, "");
   const defaultProjectWorkspaceId =
     typeof parsed.defaultProjectWorkspaceId === "string" ? parsed.defaultProjectWorkspaceId : undefined;
   const environmentId = typeof parsed.environmentId === "string" ? parsed.environmentId : undefined;
+  const validationCommand =
+    typeof parsed.validationCommand === "string"
+      ? parsed.validationCommand
+      : typeof runtimePolicy.validationCommand === "string"
+        ? runtimePolicy.validationCommand
+        : undefined;
+  const validationPlatform =
+    parseValidationPlatform(parsed.validationPlatform) ?? parseValidationPlatform(runtimePolicy.validationPlatform);
   const allowIssueOverride =
     typeof parsed.allowIssueOverride === "boolean" ? parsed.allowIssueOverride : undefined;
   const normalizedDefaultMode = (() => {
@@ -64,12 +106,10 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
     ...(parsed.workspaceRuntime && typeof parsed.workspaceRuntime === "object" && !Array.isArray(parsed.workspaceRuntime)
       ? { workspaceRuntime: { ...(parsed.workspaceRuntime as Record<string, unknown>) } }
       : {}),
-    ...(parsed.branchPolicy && typeof parsed.branchPolicy === "object" && !Array.isArray(parsed.branchPolicy)
-      ? { branchPolicy: { ...(parsed.branchPolicy as Record<string, unknown>) } }
-      : {}),
-    ...(parsed.pullRequestPolicy && typeof parsed.pullRequestPolicy === "object" && !Array.isArray(parsed.pullRequestPolicy)
-      ? { pullRequestPolicy: { ...(parsed.pullRequestPolicy as Record<string, unknown>) } }
-      : {}),
+    ...(branchPolicy ? { branchPolicy } : {}),
+    ...(pullRequestPolicy ? { pullRequestPolicy } : {}),
+    ...(validationCommand !== undefined ? { validationCommand } : {}),
+    ...(validationPlatform !== null ? { validationPlatform } : {}),
     ...(parsed.runtimePolicy && typeof parsed.runtimePolicy === "object" && !Array.isArray(parsed.runtimePolicy)
       ? { runtimePolicy: { ...(parsed.runtimePolicy as Record<string, unknown>) } }
       : {}),

@@ -22,6 +22,7 @@ import {
   executionWorkspaceService,
   mergeExecutionWorkspaceConfig,
   readExecutionWorkspaceConfig,
+  toExecutionWorkspace,
 } from "../services/execution-workspaces.ts";
 
 const execFileAsync = promisify(execFile);
@@ -115,6 +116,71 @@ describe("execution workspace config helpers", () => {
     )).toEqual({
       source: "project_primary",
     });
+  });
+
+  it("exposes bounded pull request and latest validation summaries from metadata", () => {
+    const workspace = toExecutionWorkspace({
+      id: "workspace-1",
+      companyId: "company-1",
+      projectId: "project-1",
+      projectWorkspaceId: null,
+      sourceIssueId: "issue-1",
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Issue workspace",
+      status: "active",
+      cwd: "/tmp/workspace",
+      repoUrl: "https://example.com/repo.git",
+      baseRef: "origin/main",
+      branchName: "PAP-1195-policy",
+      providerType: "git_worktree",
+      providerRef: "/tmp/workspace",
+      derivedFromExecutionWorkspaceId: null,
+      lastUsedAt: new Date("2026-05-14T00:00:00.000Z"),
+      openedAt: new Date("2026-05-14T00:00:00.000Z"),
+      closedAt: null,
+      cleanupEligibleAt: null,
+      cleanupReason: null,
+      metadata: {
+        branchSync: {
+          pullRequest: {
+            url: "https://github.com/org/repo/pull/123",
+            number: 123,
+            status: "ready",
+            title: "PAP-1195: Policy",
+          },
+        },
+        latestValidation: {
+          status: "skipped",
+          command: "./scripts/verify-mac.sh",
+          validationPlatform: "mac",
+          completedAt: "2026-05-14T00:01:00.000Z",
+          output: "x".repeat(2_100),
+          outputUrl: "https://ci.example.com/run/1",
+          skipReason: "notarization_required",
+          reason: "Notarization requires customer credentials.",
+        },
+      },
+      createdAt: new Date("2026-05-14T00:00:00.000Z"),
+      updatedAt: new Date("2026-05-14T00:00:00.000Z"),
+    } as any);
+
+    expect(workspace.pullRequest).toEqual({
+      url: "https://github.com/org/repo/pull/123",
+      number: 123,
+      state: "open",
+      title: "PAP-1195: Policy",
+      reason: null,
+    });
+    expect(workspace.latestValidation).toMatchObject({
+      status: "skipped",
+      command: "./scripts/verify-mac.sh",
+      validationPlatform: "mac",
+      outputUrl: "https://ci.example.com/run/1",
+      skipReason: "notarization_required",
+      reason: "Notarization requires customer credentials.",
+    });
+    expect(workspace.latestValidation.outputExcerpt).toHaveLength(2_000);
   });
 });
 

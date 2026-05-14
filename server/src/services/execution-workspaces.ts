@@ -12,6 +12,12 @@ import type {
   ExecutionWorkspaceCloseGitReadiness,
   ExecutionWorkspaceCloseReadiness,
   ExecutionWorkspaceConfig,
+  ExecutionWorkspacePullRequestState,
+  ExecutionWorkspacePullRequestSummary,
+  ExecutionWorkspaceValidationPlatform,
+  ExecutionWorkspaceValidationSkipReason,
+  ExecutionWorkspaceValidationStatus,
+  ExecutionWorkspaceValidationSummary,
   WorkspaceRuntimeDesiredState,
   WorkspaceRuntimeService,
 } from "@paperclipai/shared";
@@ -39,6 +45,15 @@ function readNullableString(value: unknown): string | null {
 function cloneRecord(value: unknown): Record<string, unknown> | null {
   if (!isRecord(value)) return null;
   return { ...value };
+}
+
+function readNestedRecord(root: unknown, ...path: string[]): Record<string, unknown> | null {
+  let current = root;
+  for (const key of path) {
+    if (!isRecord(current)) return null;
+    current = current[key];
+  }
+  return cloneRecord(current);
 }
 
 function readDesiredState(value: unknown): WorkspaceRuntimeDesiredState | null {
@@ -221,6 +236,95 @@ export function readExecutionWorkspaceConfig(metadata: Record<string, unknown> |
   return hasConfig ? config : null;
 }
 
+function readNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readValidationPlatform(value: unknown): ExecutionWorkspaceValidationPlatform | null {
+  return value === "mac" || value === "web" || value === "linux" || value === "windows" ? value : null;
+}
+
+function readValidationStatus(value: unknown): ExecutionWorkspaceValidationStatus {
+  if (
+    value === "running" ||
+    value === "passed" ||
+    value === "failed" ||
+    value === "skipped" ||
+    value === "blocked" ||
+    value === "error"
+  ) {
+    return value;
+  }
+  if (value === "success") return "passed";
+  return "none";
+}
+
+function readValidationSkipReason(value: unknown): ExecutionWorkspaceValidationSkipReason | null {
+  if (
+    value === "signing_required" ||
+    value === "notarization_required" ||
+    value === "customer_credentials_required" ||
+    value === "device_required"
+  ) {
+    return value;
+  }
+  return null;
+}
+
+function normalizePullRequestState(value: unknown): ExecutionWorkspacePullRequestState {
+  if (
+    value === "none" ||
+    value === "draft" ||
+    value === "open" ||
+    value === "merged" ||
+    value === "closed" ||
+    value === "manual_required"
+  ) {
+    return value;
+  }
+  if (value === "ready") return "open";
+  if (value === "not_configured" || value === "not_attempted") return "none";
+  return "none";
+}
+
+function readBoundedOutputExcerpt(value: unknown): string | null {
+  const text = readNullableString(value);
+  if (!text) return null;
+  return text.length > 2_000 ? text.slice(0, 2_000) : text;
+}
+
+function readExecutionWorkspacePullRequestSummary(metadata: Record<string, unknown> | null): ExecutionWorkspacePullRequestSummary {
+  const raw =
+    readNestedRecord(metadata, "pullRequest") ??
+    readNestedRecord(metadata, "branchSync", "pullRequest") ??
+    {};
+  return {
+    url: readNullableString(raw.url),
+    number: readNumber(raw.number),
+    state: normalizePullRequestState(raw.state ?? raw.status),
+    title: readNullableString(raw.title),
+    reason: readNullableString(raw.reason),
+  };
+}
+
+function readExecutionWorkspaceValidationSummary(metadata: Record<string, unknown> | null): ExecutionWorkspaceValidationSummary {
+  const raw =
+    readNestedRecord(metadata, "latestValidation") ??
+    readNestedRecord(metadata, "validation") ??
+    readNestedRecord(metadata, "branchSync", "validation") ??
+    {};
+  return {
+    status: readValidationStatus(raw.status),
+    command: readNullableString(raw.command),
+    validationPlatform: readValidationPlatform(raw.validationPlatform ?? raw.platform),
+    completedAt: readNullableString(raw.completedAt) ?? readNullableString(raw.finishedAt) ?? readNullableString(raw.updatedAt),
+    outputExcerpt: readBoundedOutputExcerpt(raw.outputExcerpt ?? raw.output ?? raw.stdout ?? raw.stderr ?? raw.log),
+    outputUrl: readNullableString(raw.outputUrl),
+    skipReason: readValidationSkipReason(raw.skipReason ?? raw.reasonCode),
+    reason: readNullableString(raw.reason) ?? readNullableString(raw.error),
+  };
+}
+
 export function mergeExecutionWorkspaceConfig(
   metadata: Record<string, unknown> | null | undefined,
   patch: Partial<ExecutionWorkspaceConfig> | null,
@@ -314,6 +418,7 @@ function toExecutionWorkspace(
   row: ExecutionWorkspaceRow,
   runtimeServices: WorkspaceRuntimeService[] = [],
 ): ExecutionWorkspace {
+  const metadata = (row.metadata as Record<string, unknown> | null) ?? null;
   return {
     id: row.id,
     companyId: row.companyId,
@@ -336,8 +441,10 @@ function toExecutionWorkspace(
     closedAt: row.closedAt ?? null,
     cleanupEligibleAt: row.cleanupEligibleAt ?? null,
     cleanupReason: row.cleanupReason ?? null,
-    config: readExecutionWorkspaceConfig((row.metadata as Record<string, unknown> | null) ?? null),
-    metadata: (row.metadata as Record<string, unknown> | null) ?? null,
+    config: readExecutionWorkspaceConfig(metadata),
+    pullRequest: readExecutionWorkspacePullRequestSummary(metadata),
+    latestValidation: readExecutionWorkspaceValidationSummary(metadata),
+    metadata,
     runtimeServices,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,

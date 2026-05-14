@@ -13,6 +13,25 @@ const executionWorkspaceStrategySchema = z
   })
   .strict();
 
+const projectExecutionWorkspaceBranchPolicySchema = z
+  .object({
+    syncBeforeStart: z.boolean().optional(),
+    syncBeforeReview: z.boolean().optional(),
+    deleteAfterMerge: z.boolean().optional(),
+    syncStrategy: z.enum(["rebase", "merge"]).optional(),
+  })
+  .passthrough();
+
+const projectExecutionWorkspacePullRequestPolicySchema = z
+  .object({
+    mode: z.enum(["none", "draft_until_verified", "ready_immediately"]).optional(),
+    titleTemplate: z.string().optional().nullable(),
+    remote: z.string().optional().nullable(),
+  })
+  .passthrough();
+
+const projectExecutionWorkspaceValidationPlatformSchema = z.enum(["mac", "web", "linux", "windows"]);
+
 export const projectExecutionWorkspacePolicySchema = z
   .object({
     enabled: z.boolean(),
@@ -22,8 +41,10 @@ export const projectExecutionWorkspacePolicySchema = z
     environmentId: z.string().uuid().optional().nullable(),
     workspaceStrategy: executionWorkspaceStrategySchema.optional().nullable(),
     workspaceRuntime: z.record(z.unknown()).optional().nullable(),
-    branchPolicy: z.record(z.unknown()).optional().nullable(),
-    pullRequestPolicy: z.record(z.unknown()).optional().nullable(),
+    branchPolicy: projectExecutionWorkspaceBranchPolicySchema.optional().nullable(),
+    pullRequestPolicy: projectExecutionWorkspacePullRequestPolicySchema.optional().nullable(),
+    validationCommand: z.string().optional().nullable(),
+    validationPlatform: projectExecutionWorkspaceValidationPlatformSchema.optional().nullable(),
     runtimePolicy: z.record(z.unknown()).optional().nullable(),
     cleanupPolicy: z.record(z.unknown()).optional().nullable(),
   })

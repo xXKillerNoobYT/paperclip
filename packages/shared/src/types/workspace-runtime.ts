@@ -77,6 +77,74 @@ export interface ExecutionWorkspaceStrategy {
   teardownCommand?: string | null;
 }
 
+export interface ExecutionWorkspaceBranchPolicy {
+  syncBeforeStart?: boolean;
+  syncBeforeReview?: boolean;
+  deleteAfterMerge?: boolean;
+  syncStrategy?: "rebase" | "merge";
+  [key: string]: unknown;
+}
+
+export type ExecutionWorkspacePullRequestMode =
+  | "none"
+  | "draft_until_verified"
+  | "ready_immediately";
+
+export interface ExecutionWorkspacePullRequestPolicy {
+  mode?: ExecutionWorkspacePullRequestMode;
+  titleTemplate?: string | null;
+  remote?: string | null;
+  [key: string]: unknown;
+}
+
+export type ExecutionWorkspaceValidationPlatform =
+  | "mac"
+  | "web"
+  | "linux"
+  | "windows";
+
+export type ExecutionWorkspacePullRequestState =
+  | "none"
+  | "draft"
+  | "open"
+  | "merged"
+  | "closed"
+  | "manual_required";
+
+export interface ExecutionWorkspacePullRequestSummary {
+  url: string | null;
+  number: number | null;
+  state: ExecutionWorkspacePullRequestState;
+  title: string | null;
+  reason: string | null;
+}
+
+export type ExecutionWorkspaceValidationStatus =
+  | "none"
+  | "running"
+  | "passed"
+  | "failed"
+  | "skipped"
+  | "blocked"
+  | "error";
+
+export type ExecutionWorkspaceValidationSkipReason =
+  | "signing_required"
+  | "notarization_required"
+  | "customer_credentials_required"
+  | "device_required";
+
+export interface ExecutionWorkspaceValidationSummary {
+  status: ExecutionWorkspaceValidationStatus;
+  command: string | null;
+  validationPlatform: ExecutionWorkspaceValidationPlatform | null;
+  completedAt: string | null;
+  outputExcerpt: string | null;
+  outputUrl: string | null;
+  skipReason: ExecutionWorkspaceValidationSkipReason | null;
+  reason: string | null;
+}
+
 export interface ExecutionWorkspaceConfig {
   environmentId?: string | null;
   provisionCommand: string | null;
@@ -151,8 +219,10 @@ export interface ProjectExecutionWorkspacePolicy {
   environmentId?: string | null;
   workspaceStrategy?: ExecutionWorkspaceStrategy | null;
   workspaceRuntime?: Record<string, unknown> | null;
-  branchPolicy?: Record<string, unknown> | null;
-  pullRequestPolicy?: Record<string, unknown> | null;
+  branchPolicy?: ExecutionWorkspaceBranchPolicy | null;
+  pullRequestPolicy?: ExecutionWorkspacePullRequestPolicy | null;
+  validationCommand?: string | null;
+  validationPlatform?: ExecutionWorkspaceValidationPlatform | null;
   runtimePolicy?: Record<string, unknown> | null;
   cleanupPolicy?: Record<string, unknown> | null;
 }
@@ -194,6 +264,8 @@ export interface ExecutionWorkspace {
   cleanupEligibleAt: Date | null;
   cleanupReason: string | null;
   config: ExecutionWorkspaceConfig | null;
+  pullRequest?: ExecutionWorkspacePullRequestSummary;
+  latestValidation?: ExecutionWorkspaceValidationSummary;
   metadata: Record<string, unknown> | null;
   runtimeServices?: WorkspaceRuntimeService[];
   createdAt: Date;

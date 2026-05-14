@@ -119,22 +119,46 @@ describe("execution workspace policy helpers", () => {
         enabled: true,
         defaultMode: "isolated",
         environmentId: "8f8ab8f2-d95f-4315-9f08-d683a1e0f73b",
+        validationCommand: "./scripts/verify-mac.sh",
+        validationPlatform: "mac",
         workspaceStrategy: {
           type: "git_worktree",
           worktreeParentDir: ".paperclip/worktrees",
           provisionCommand: "bash ./scripts/provision-worktree.sh",
           teardownCommand: "bash ./scripts/teardown-worktree.sh",
         },
+        branchPolicy: {
+          syncBeforeStart: true,
+          syncBeforeReview: true,
+          deleteAfterMerge: false,
+          customCompatibilityField: "kept",
+        },
+        pullRequestPolicy: {
+          mode: "draft_until_verified",
+          titleTemplate: "{{issue.identifier}}: {{issue.title}}",
+        },
       }),
     ).toEqual({
       enabled: true,
       defaultMode: "isolated_workspace",
       environmentId: "8f8ab8f2-d95f-4315-9f08-d683a1e0f73b",
+      validationCommand: "./scripts/verify-mac.sh",
+      validationPlatform: "mac",
       workspaceStrategy: {
         type: "git_worktree",
         worktreeParentDir: ".paperclip/worktrees",
         provisionCommand: "bash ./scripts/provision-worktree.sh",
         teardownCommand: "bash ./scripts/teardown-worktree.sh",
+      },
+      branchPolicy: {
+        syncBeforeStart: true,
+        syncBeforeReview: true,
+        deleteAfterMerge: false,
+        customCompatibilityField: "kept",
+      },
+      pullRequestPolicy: {
+        mode: "draft_until_verified",
+        titleTemplate: "{{issue.identifier}}: {{issue.title}}",
       },
     });
     expect(
