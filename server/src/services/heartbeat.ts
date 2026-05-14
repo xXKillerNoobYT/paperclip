@@ -7126,7 +7126,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             `- Branch: ${error.sync.branchName ?? "unknown"}`,
             `- Base ref: ${error.sync.baseRef ?? "unknown"}`,
             `- Status: ${error.sync.status}`,
-            `- Owner/action: ${blocker?.owner ?? "implementation_owner"} — ${blocker?.action ?? "Resolve the branch sync blocker."}`,
+            `- Owner/action: ${blocker?.owner ?? "implementation_owner"} - ${blocker?.action ?? "Resolve the branch sync blocker."}`,
             `- Details: ${blocker?.details ?? error.message}`,
           ].join("\n"),
           { agentId: agent.id, runId: run.id },

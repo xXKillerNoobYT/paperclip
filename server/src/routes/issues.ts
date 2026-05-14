@@ -63,6 +63,7 @@ import {
   logActivity,
   projectService,
   routineService,
+  workspaceOperationService,
   workProductService,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
@@ -98,6 +99,10 @@ import {
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
+import {
+  ExecutionWorkspaceBranchSyncError,
+  synchronizeExecutionWorkspaceBranch,
+} from "../services/workspace-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
@@ -822,6 +827,7 @@ export function issueRoutes(
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
+  const workspaceOperationsSvc = workspaceOperationService(db);
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
   const issueReferencesSvc = issueReferenceService(db);
@@ -2603,7 +2609,7 @@ export function issueRoutes(
         ? await svc.getRelationSummaries(existing.id)
         : null;
     const {
-      comment: commentBody,
+      comment: rawCommentBody,
       reviewRequest,
       reopen: reopenRequested,
       resume: resumeRequested,
@@ -2611,6 +2617,7 @@ export function issueRoutes(
       hiddenAt: hiddenAtRaw,
       ...updateFields
     } = req.body;
+    let commentBody = rawCommentBody;
     const shouldCancelActiveRunForCancelledStatus =
       existing.status !== "cancelled" && updateFields.status === "cancelled";
     if (resumeRequested === true && !commentBody) {
@@ -2767,6 +2774,64 @@ export function issueRoutes(
       updateFields,
       actor,
     });
+
+    const shouldSyncBranchBeforeReview =
+      existing.status !== "in_review" &&
+      updateFields.status === "in_review" &&
+      existing.executionWorkspaceId;
+    if (shouldSyncBranchBeforeReview) {
+      const [executionWorkspace, project] = await Promise.all([
+        executionWorkspacesSvc.getById(existing.executionWorkspaceId!),
+        existing.projectId ? projectsSvc.getById(existing.projectId) : null,
+      ]);
+      const branchPolicy = project?.executionWorkspacePolicy?.branchPolicy ?? null;
+      const pullRequestPolicy = project?.executionWorkspacePolicy?.pullRequestPolicy ?? null;
+      if (executionWorkspace?.providerType === "git_worktree" && executionWorkspace.cwd) {
+        const recorder = workspaceOperationsSvc.createRecorder({
+          companyId: existing.companyId,
+          heartbeatRunId: actor.runId ?? null,
+          executionWorkspaceId: executionWorkspace.id,
+        });
+        try {
+          const branchSync = await synchronizeExecutionWorkspaceBranch({
+            cwd: executionWorkspace.providerRef ?? executionWorkspace.cwd,
+            branchName: executionWorkspace.branchName ?? null,
+            baseRef: executionWorkspace.baseRef ?? null,
+            branchPolicy,
+            pullRequestPolicy,
+            stage: "review",
+            issue: {
+              id: existing.id,
+              identifier: existing.identifier,
+              title: existing.title,
+              workMode: existing.workMode,
+            },
+            recorder,
+          });
+          if (branchSync) {
+            await executionWorkspacesSvc.update(executionWorkspace.id, {
+              metadata: {
+                ...(executionWorkspace.metadata ?? {}),
+                branchSync,
+              },
+            });
+          }
+        } catch (error) {
+          if (!(error instanceof ExecutionWorkspaceBranchSyncError)) throw error;
+          const blocker = error.sync.blocker;
+          updateFields.status = "blocked";
+          commentBody = [
+            [commentBody, "Blocked by branch lifecycle sync."].filter(Boolean).join("\n\n"),
+            "",
+            `- Branch: ${error.sync.branchName ?? "unknown"}`,
+            `- Base ref: ${error.sync.baseRef ?? "unknown"}`,
+            `- Status: ${error.sync.status}`,
+            `- Owner/action: ${blocker?.owner ?? "implementation_owner"} - ${blocker?.action ?? "Resolve the branch sync blocker."}`,
+            `- Details: ${blocker?.details ?? error.message}`,
+          ].join("\n");
+        }
+      }
+    }
 
     const nextAssigneeAgentId =
       updateFields.assigneeAgentId === undefined ? existing.assigneeAgentId : (updateFields.assigneeAgentId as string | null);
