@@ -40,6 +40,12 @@ export interface PreparedSandboxManagedRuntime {
   restoreWorkspace(): Promise<void>;
 }
 
+export const LOCAL_ONLY_WORKSPACE_ENTRIES = [".paperclip", ".paperclip-runtime"] as const;
+
+export function mergeLocalOnlyWorkspaceExcludes(entries: string[] | undefined): string[] {
+  return [...new Set([...LOCAL_ONLY_WORKSPACE_ENTRIES, ...(entries ?? [])])];
+}
+
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -248,19 +254,20 @@ export async function prepareSandboxManagedRuntime(input: {
 }): Promise<PreparedSandboxManagedRuntime> {
   const workspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const runtimeRootDir = path.posix.join(workspaceRemoteDir, ".paperclip-runtime", input.adapterKey);
+  const workspaceExclude = mergeLocalOnlyWorkspaceExcludes(input.workspaceExclude);
 
   await withTempDir("paperclip-sandbox-sync-", async (tempDir) => {
     const workspaceTarPath = path.join(tempDir, "workspace.tar");
     await createTarballFromDirectory({
       localDir: input.workspaceLocalDir,
       archivePath: workspaceTarPath,
-      exclude: input.workspaceExclude,
+      exclude: workspaceExclude,
     });
     const workspaceTarBytes = await fs.readFile(workspaceTarPath);
     const remoteWorkspaceTar = path.posix.join(runtimeRootDir, "workspace-upload.tar");
     await input.client.makeDir(runtimeRootDir);
     await input.client.writeFile(remoteWorkspaceTar, toArrayBuffer(workspaceTarBytes));
-    const preservedNames = new Set([".paperclip-runtime", ...(input.preserveAbsentOnRestore ?? [])]);
+    const preservedNames = new Set([...LOCAL_ONLY_WORKSPACE_ENTRIES, ...(input.preserveAbsentOnRestore ?? [])]);
     const findPreserveArgs = [...preservedNames].map((entry) => `! -name ${shellQuote(entry)}`).join(" ");
     await input.client.run(
       `sh -lc ${shellQuote(
@@ -313,7 +320,7 @@ export async function prepareSandboxManagedRuntime(input: {
           `sh -lc ${shellQuote(
             `mkdir -p ${shellQuote(runtimeRootDir)} && ` +
               `tar -cf ${shellQuote(remoteWorkspaceTar)} -C ${shellQuote(workspaceRemoteDir)} ` +
-              `${tarExcludeFlags(input.workspaceExclude)} .`,
+              `${tarExcludeFlags(workspaceExclude)} .`,
           )}`,
           { timeoutMs: input.spec.timeoutMs },
         );
@@ -327,7 +334,7 @@ export async function prepareSandboxManagedRuntime(input: {
           localDir: extractedDir,
         });
         await mirrorDirectory(extractedDir, input.workspaceLocalDir, {
-          preserveAbsent: [".paperclip-runtime", ...(input.preserveAbsentOnRestore ?? [])],
+          preserveAbsent: [...LOCAL_ONLY_WORKSPACE_ENTRIES, ...(input.preserveAbsentOnRestore ?? [])],
         });
       });
     },
