@@ -4,6 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { LOCAL_ONLY_WORKSPACE_ENTRIES } from "./sandbox-managed-runtime.js";
 import type { RunProcessResult } from "./server-utils.js";
 
 export interface SshConnectionConfig {
@@ -995,7 +996,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
-      exclude: [".git", ".paperclip-runtime"],
+      exclude: [".git", ...LOCAL_ONLY_WORKSPACE_ENTRIES],
     });
     await removeDeletedPathsOnSsh({
       spec: input.spec,
@@ -1008,13 +1009,13 @@ export async function prepareWorkspaceForSshExecution(input: {
   await clearRemoteDirectory({
     spec: input.spec,
     remoteDir,
-    preserveEntries: [".paperclip-runtime"],
+    preserveEntries: [...LOCAL_ONLY_WORKSPACE_ENTRIES],
   });
   await syncDirectoryToSsh({
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [...LOCAL_ONLY_WORKSPACE_ENTRIES],
   });
 }
 
@@ -1036,7 +1037,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
       spec: input.spec,
       remoteDir,
       localDir: input.localDir,
-      exclude: [".git", ".paperclip-runtime"],
+      exclude: [".git", ...LOCAL_ONLY_WORKSPACE_ENTRIES],
       preserveLocalEntries: [".git"],
     });
     return;
@@ -1046,7 +1047,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
     spec: input.spec,
     remoteDir,
     localDir: input.localDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [...LOCAL_ONLY_WORKSPACE_ENTRIES],
   });
 }
 
