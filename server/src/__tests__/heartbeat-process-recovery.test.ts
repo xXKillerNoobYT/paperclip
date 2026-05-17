@@ -397,6 +397,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     adapterType?: string;
     agentStatus?: "paused" | "idle" | "running";
     runStatus?: "running" | "queued" | "failed";
+    contextSnapshot?: Record<string, unknown>;
     processPid?: number | null;
     processGroupId?: number | null;
     processLossRetryCount?: number;
@@ -452,7 +453,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       triggerDetail: "system",
       status: input?.runStatus ?? "running",
       wakeupRequestId,
-      contextSnapshot: input?.includeIssue === false ? {} : { issueId },
+      contextSnapshot: {
+        ...(input?.includeIssue === false ? {} : { issueId }),
+        ...(input?.contextSnapshot ?? {}),
+      },
       processPid: input?.processPid ?? null,
       processGroupId: input?.processGroupId ?? null,
       processLossRetryCount: input?.processLossRetryCount ?? 0,
@@ -889,6 +893,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run?.status).toBe("running");
     expect(run?.errorCode).toBe("process_detached");
     expect(run?.error).toContain(String(child.pid));
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("claimed");
+  });
+
+  it("does not reap a run owned by another live heartbeat service instance", async () => {
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      contextSnapshot: {
+        paperclipExecutionOwner: {
+          instanceId: "peer-paperclip-server",
+          heartbeatAt: new Date().toISOString(),
+        },
+      },
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+    expect(result.reaped).toBe(0);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
 
     const wakeup = await db
       .select()

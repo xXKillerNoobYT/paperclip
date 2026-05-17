@@ -170,6 +170,9 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+const EXECUTION_OWNER_CONTEXT_KEY = "paperclipExecutionOwner";
+const EXECUTION_OWNER_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+const SERVER_INSTANCE_ID = `${process.pid}-${randomUUID()}`;
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -1033,6 +1036,41 @@ export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWork
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+type ExecutionOwnerSnapshot = {
+  instanceId: string;
+  heartbeatAt: string | null;
+};
+
+function buildExecutionOwnerSnapshot(now = new Date()): ExecutionOwnerSnapshot {
+  return {
+    instanceId: SERVER_INSTANCE_ID,
+    heartbeatAt: now.toISOString(),
+  };
+}
+
+function readExecutionOwnerSnapshot(contextSnapshot: unknown): ExecutionOwnerSnapshot | null {
+  const owner = parseObject(parseObject(contextSnapshot)[EXECUTION_OWNER_CONTEXT_KEY]);
+  const instanceId = readNonEmptyString(owner.instanceId);
+  if (!instanceId) return null;
+  return {
+    instanceId,
+    heartbeatAt: readNonEmptyString(owner.heartbeatAt),
+  };
+}
+
+function isRunOwnedByLivePeer(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,
+  staleThresholdMs: number,
+  now: Date,
+) {
+  if (staleThresholdMs <= 0) return false;
+  const owner = readExecutionOwnerSnapshot(run.contextSnapshot);
+  if (!owner || owner.instanceId === SERVER_INSTANCE_ID || !owner.heartbeatAt) return false;
+  const heartbeatAt = new Date(owner.heartbeatAt).getTime();
+  if (Number.isNaN(heartbeatAt)) return false;
+  return now.getTime() - heartbeatAt < staleThresholdMs;
 }
 
 function readModelProfileKey(value: unknown): ModelProfileKey | null {
@@ -2333,6 +2371,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  async function persistExecutionOwnerHeartbeat(runId: string, contextSnapshot: Record<string, unknown>) {
+    contextSnapshot[EXECUTION_OWNER_CONTEXT_KEY] = buildExecutionOwnerSnapshot();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")));
+  }
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -6430,6 +6478,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
+      const executionOwner = readExecutionOwnerSnapshot(run.contextSnapshot);
+      if (isRunOwnedByLivePeer(run, staleThresholdMs, now)) continue;
+
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
@@ -6522,6 +6573,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         payload: {
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+          ...(executionOwner ? { executionOwner } : {}),
+          ...(staleThresholdMs > 0 ? { staleThresholdMs } : {}),
+          retryQueued: Boolean(retriedRun),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
         },
@@ -6741,6 +6795,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     activeRunExecutions.add(run.id);
+    let executionOwnerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
     try {
     const agent = await getAgent(run.agentId);
@@ -6761,6 +6816,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
+    await persistExecutionOwnerHeartbeat(run.id, context);
+    executionOwnerHeartbeatTimer = setInterval(() => {
+      void persistExecutionOwnerHeartbeat(run.id, context).catch((err) => {
+        logger.warn({ err, runId: run.id }, "failed to refresh heartbeat execution owner lease");
+      });
+    }, EXECUTION_OWNER_HEARTBEAT_INTERVAL_MS);
+    executionOwnerHeartbeatTimer.unref?.();
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
@@ -8092,6 +8154,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // DB calls threw (e.g. a transient DB error in finalizeAgentStatus).
           await finalizeAgentStatus(run.agentId, "failed").catch(() => undefined);
         } finally {
+          if (executionOwnerHeartbeatTimer) clearInterval(executionOwnerHeartbeatTimer);
           const latestRun = await getRun(run.id).catch(() => null);
           await releaseEnvironmentLeasesForRun({
             runId: run.id,
