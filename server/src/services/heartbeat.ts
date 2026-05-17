@@ -7736,13 +7736,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      const runtimeCommandSpec = (() => {
+        const spec = adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null;
+        if (!spec) return null;
+        const detectCommand = typeof spec.detectCommand === "string" ? spec.detectCommand.trim() : "";
+        return {
+          ...spec,
+          detectCommand: detectCommand.length > 0 ? detectCommand : spec.command,
+        };
+      })();
+
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
         runtime: runtimeForAdapter,
         config: runtimeConfig,
         context,
-        runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
+        runtimeCommandSpec,
         executionTarget,
         executionTransport: remoteExecution
           ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }

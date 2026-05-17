@@ -324,6 +324,108 @@ describe("ensureAdapterExecutionTargetRuntimeCommandInstalled", () => {
     }));
   });
 
+  it("skips install when detectCommand is already resolvable", async () => {
+    const runner = {
+      execute: vi.fn(async (input: { args?: string[] }) => {
+        const script = input.args?.[1] ?? "";
+        if (script.includes("command -v")) {
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            stdout: "",
+            stderr: "",
+            pid: null,
+            startedAt: new Date().toISOString(),
+          };
+        }
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          stdout: "",
+          stderr: "",
+          pid: null,
+          startedAt: new Date().toISOString(),
+        };
+      }),
+    };
+
+    await ensureAdapterExecutionTargetRuntimeCommandInstalled({
+      runId: "run-skip-detect",
+      target: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "e2b",
+        remoteCwd: "/remote/workspace",
+        runner,
+      },
+      installCommand: "npm install -g hermes-paperclip-adapter",
+      detectCommand: "hermes",
+      cwd: "/local/workspace",
+      env: { PATH: "/usr/bin" },
+      timeoutSec: 30,
+    });
+
+    expect(runner.execute).toHaveBeenCalledTimes(1);
+    expect(runner.execute).toHaveBeenCalledWith(expect.objectContaining({
+      args: ["-c", "command -v 'hermes' >/dev/null 2>&1"],
+    }));
+  });
+
+  it("continues after install failure when detectCommand becomes resolvable", async () => {
+    const runner = {
+      execute: vi.fn(async (input: { args?: string[] }) => {
+        const script = input.args?.[1] ?? "";
+        if (script.includes("command -v")) {
+          const probeCount = runner.execute.mock.calls.filter((call) => (call[0].args?.[1] ?? "").includes("command -v")).length;
+          return {
+            exitCode: probeCount >= 2 ? 0 : 1,
+            signal: null,
+            timedOut: false,
+            stdout: "",
+            stderr: "",
+            pid: null,
+            startedAt: new Date().toISOString(),
+          };
+        }
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          stdout: "",
+          stderr: "npm ERR! code E429",
+          pid: null,
+          startedAt: new Date().toISOString(),
+        };
+      }),
+    };
+    const onLog = vi.fn(async () => {});
+
+    await expect(ensureAdapterExecutionTargetRuntimeCommandInstalled({
+      runId: "run-install-recheck",
+      target: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "e2b",
+        remoteCwd: "/remote/workspace",
+        runner,
+      },
+      installCommand: "npm install -g hermes-paperclip-adapter",
+      detectCommand: "hermes",
+      cwd: "/local/workspace",
+      env: { PATH: "/usr/bin" },
+      timeoutSec: 30,
+      onLog,
+    })).resolves.toBeUndefined();
+
+    expect(runner.execute).toHaveBeenCalledTimes(3);
+    expect(onLog).toHaveBeenCalledWith(
+      "stderr",
+      expect.stringContaining("Install command exited 1 (npm install -g hermes-paperclip-adapter) but hermes is on PATH; continuing."),
+    );
+  });
+
   it("skips install commands for SSH targets", async () => {
     const runSshCommandSpy = vi.spyOn(ssh, "runSshCommand").mockResolvedValue({
       stdout: "",
