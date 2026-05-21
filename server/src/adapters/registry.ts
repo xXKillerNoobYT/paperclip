@@ -377,11 +377,82 @@ const piLocalAdapter: ServerAdapterModule = {
 // intentional until hermes ships a matching AdapterExecutionContext type.
 const executeHermesLocal = hermesExecute as unknown as ServerAdapterModule["execute"];
 
+type AdapterExecuteContext = Parameters<ServerAdapterModule["execute"]>[0];
+type AdapterExecuteResult = Awaited<ReturnType<ServerAdapterModule["execute"]>>;
+
+const HERMES_MISSING_SESSION_RE = /Session not found:\s*([^\n]+)/i;
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function readResultJsonString(result: AdapterExecuteResult, key: string): string | null {
+  const resultJson = result.resultJson;
+  if (!resultJson || typeof resultJson !== "object" || Array.isArray(resultJson)) return null;
+  return readString((resultJson as Record<string, unknown>)[key]);
+}
+
+function getHermesResultText(result: AdapterExecuteResult) {
+  return [
+    readString(result.errorMessage),
+    readString(result.summary),
+    readResultJsonString(result, "result"),
+  ].filter(Boolean).join("\n");
+}
+
+function isHermesMissingSessionResult(result: AdapterExecuteResult) {
+  return HERMES_MISSING_SESSION_RE.test(getHermesResultText(result));
+}
+
+function stripHermesSessionState(result: AdapterExecuteResult): AdapterExecuteResult {
+  const resultJson = result.resultJson && typeof result.resultJson === "object" && !Array.isArray(result.resultJson)
+    ? { ...(result.resultJson as Record<string, unknown>), session_id: null }
+    : result.resultJson;
+  return {
+    ...result,
+    resultJson,
+    sessionParams: null,
+    sessionDisplayId: null,
+    clearSession: true,
+  };
+}
+
+async function executeHermesLocalWithMissingSessionRetry(
+  ctx: AdapterExecuteContext,
+): Promise<AdapterExecuteResult> {
+  const firstResult = await executeHermesLocal(ctx);
+  if (!isHermesMissingSessionResult(firstResult)) return firstResult;
+
+  const previousSessionId =
+    readString(ctx.runtime?.sessionDisplayId) ??
+    readString(ctx.runtime?.sessionParams?.sessionId) ??
+    readString(ctx.runtime?.sessionId);
+  if (!previousSessionId) return stripHermesSessionState(firstResult);
+
+  await ctx.onLog?.(
+    "stdout",
+    `[hermes] Saved session "${previousSessionId}" was not found by Hermes; retrying once with a fresh session.\n`,
+  );
+  const retryCtx: AdapterExecuteContext = {
+    ...ctx,
+    runtime: {
+      ...ctx.runtime,
+      sessionId: null,
+      sessionParams: null,
+      sessionDisplayId: null,
+    },
+  };
+  const retryResult = await executeHermesLocal(retryCtx);
+  return isHermesMissingSessionResult(retryResult)
+    ? stripHermesSessionState(retryResult)
+    : retryResult;
+}
+
 const hermesLocalAdapter: ServerAdapterModule = {
   type: "hermes_local",
   execute: async (ctx) => {
     const normalizedCtx = normalizeHermesConfig(ctx);
-    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
+    if (!normalizedCtx.authToken) return executeHermesLocalWithMissingSessionRetry(normalizedCtx);
 
     const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
     const existingEnv =
@@ -425,7 +496,7 @@ const hermesLocalAdapter: ServerAdapterModule = {
       },
     };
 
-    return executeHermesLocal(patchedCtx);
+    return executeHermesLocalWithMissingSessionRetry(patchedCtx);
   },
   testEnvironment: (ctx) => hermesTestEnvironment(normalizeHermesConfig(ctx) as never),
   sessionCodec: hermesSessionCodec,

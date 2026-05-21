@@ -451,6 +451,119 @@ describe("server adapter registry", () => {
     // Auth token is still injected.
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
   });
+
+  it("retries Hermes once with a fresh session when the saved session is missing", async () => {
+    const adapter = requireServerAdapter("hermes_local");
+    const onLog = vi.fn(async () => {});
+    hermesExecuteMock
+      .mockResolvedValueOnce({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        summary: "Session not found: 20260520_194040_\nUse a session ID from a previous CLI run (hermes sessions list).",
+        resultJson: {
+          result: "Session not found: 20260520_194040_\nUse a session ID from a previous CLI run (hermes sessions list).",
+          session_id: "from",
+        },
+        sessionParams: { sessionId: "from" },
+        sessionDisplayId: "from",
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "fresh run ok",
+        resultJson: { result: "fresh run ok", session_id: "20260521_010203_abcd" },
+        sessionParams: { sessionId: "20260521_010203_abcd" },
+        sessionDisplayId: "20260521_010203",
+      });
+
+    const result = await adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "Hermes Agent",
+        role: "engineer",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "20260520_194040_",
+        sessionParams: { sessionId: "20260520_194040_" },
+        sessionDisplayId: "20260520_194040_",
+      },
+      config: {},
+      context: {},
+      onLog,
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(hermesExecuteMock).toHaveBeenCalledTimes(2);
+    expect(hermesExecuteMock.mock.calls[0][0].runtime.sessionParams).toEqual({
+      sessionId: "20260520_194040_",
+    });
+    expect(hermesExecuteMock.mock.calls[1][0].runtime).toMatchObject({
+      sessionId: null,
+      sessionParams: null,
+      sessionDisplayId: null,
+    });
+    expect(onLog).toHaveBeenCalledWith(
+      "stdout",
+      expect.stringContaining("retrying once with a fresh session"),
+    );
+    expect(result).toMatchObject({
+      exitCode: 0,
+      summary: "fresh run ok",
+      sessionParams: { sessionId: "20260521_010203_abcd" },
+    });
+  });
+
+  it("clears Hermes session state when a missing-session retry cannot recover", async () => {
+    const adapter = requireServerAdapter("hermes_local");
+    hermesExecuteMock.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      summary: "Session not found: 20260520_194040_\nUse a session ID from a previous CLI run (hermes sessions list).",
+      resultJson: {
+        result: "Session not found: 20260520_194040_\nUse a session ID from a previous CLI run (hermes sessions list).",
+        session_id: "from",
+      },
+      sessionParams: { sessionId: "from" },
+      sessionDisplayId: "from",
+    });
+
+    const result = await adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "Hermes Agent",
+        role: "engineer",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "20260520_194040_",
+        sessionParams: { sessionId: "20260520_194040_" },
+      },
+      config: {},
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(hermesExecuteMock).toHaveBeenCalledTimes(2);
+    expect(result.clearSession).toBe(true);
+    expect(result.sessionParams).toBeNull();
+    expect(result.sessionDisplayId).toBeNull();
+    expect(result.resultJson).toMatchObject({ session_id: null });
+  });
 });
 
 describe("resolveExternalAdapterRegistration", () => {
