@@ -11,6 +11,7 @@ const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
+  getDependencyReadiness: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
 }));
@@ -89,6 +90,10 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => mockInstanceSettingsService,
     issueApprovalService: () => ({}),
+    issueThreadInteractionService: () => ({
+      expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+      listForIssue: vi.fn(async () => []),
+    }),
     issueReferenceService: () => ({
       deleteDocumentSource: async () => undefined,
       diffIssueReferenceSummary: () => ({
@@ -107,6 +112,9 @@ function registerModuleMocks() {
     projectService: () => ({}),
     routineService: () => mockRoutineService,
     workProductService: () => ({}),
+    workspaceOperationService: () => ({
+      createRecorder: () => ({}),
+    }),
   }));
 }
 
@@ -166,6 +174,7 @@ describe("issue activity event routes", () => {
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 0 });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockAccessService.canUser.mockResolvedValue(false);
@@ -190,6 +199,63 @@ describe("issue activity event routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
+  });
+
+  it("does not implicitly reopen or wake assigned agents for ordinary comments on blocked issues", async () => {
+    const issue = { ...makeIssue(), status: "blocked" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "33333333-3333-4333-8333-333333333333",
+      issueId: issue.id,
+      body: "No new QA or implementation delta. Still blocked on external provider evidence.",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "No new QA or implementation delta. Still blocked on external provider evidence." });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_added",
+        entityId: issue.id,
+        details: expect.not.objectContaining({ reopened: true }),
+      }),
+    );
+  });
+
+  it("still reopens and wakes blocked issues when the comment explicitly requests reopen", async () => {
+    const issue = { ...makeIssue(), status: "blocked" };
+    const reopenedIssue = { ...issue, status: "todo" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockResolvedValue(reopenedIssue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "44444444-4444-4444-8444-444444444444",
+      issueId: issue.id,
+      body: "New provider artifact is attached; please resume.",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${issue.id}/comments`)
+      .send({ body: "New provider artifact is attached; please resume.", reopen: true });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(issue.id, { status: "todo" });
+    await vi.waitFor(() => {
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        issue.assigneeAgentId,
+        expect.objectContaining({
+          reason: "issue_reopened_via_comment",
+          payload: expect.objectContaining({
+            issueId: issue.id,
+            reopenedFrom: "blocked",
+          }),
+        }),
+      );
+    });
   });
 
   it("logs blocker activity with added and removed issue summaries", async () => {

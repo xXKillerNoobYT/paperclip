@@ -43,6 +43,9 @@ vi.mock("../services/index.js", () => ({
   }),
   documentService: () => ({}),
   executionWorkspaceService: () => ({}),
+  workspaceOperationService: () => ({
+    createRecorder: () => ({}),
+  }),
   feedbackService: () => ({
     listIssueVotesForUser: vi.fn(async () => []),
     saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
@@ -101,6 +104,9 @@ function registerModuleMocks() {
     }),
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
+    workspaceOperationService: () => ({
+      createRecorder: () => ({}),
+    }),
     feedbackService: () => ({
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
