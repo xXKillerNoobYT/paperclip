@@ -503,6 +503,100 @@ describe("claude execute", () => {
     }
   });
 
+  it("classifies unstructured Claude login failures with clear auth metadata", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-auth-text-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root, {
+      commandWriter: (commandPath) =>
+        writeTextFailingClaudeCommand(commandPath, {
+          stderr: "Not logged in - Please run /login\n",
+        }),
+    });
+
+    try {
+      const result = await execute({
+        runId: "run-auth-text",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("claude_auth_required");
+      expect(result.errorMessage).toContain("Claude Code is not logged in or its login has expired");
+      expect(result.errorMessage).toContain("claude login");
+      expect(result.errorMeta).toMatchObject({
+        category: "auth",
+        reason: "claude_auth_required",
+        status: "expired_or_missing",
+      });
+      expect(result.resultJson).toMatchObject({
+        errorCode: "claude_auth_required",
+        errorCategory: "auth",
+        stderr: "Not logged in - Please run /login\n",
+      });
+      expect(result.clearSession).toBe(false);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies structured Claude login failures without treating them as generic adapter errors", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-auth-json-"));
+    const resultEvent = {
+      type: "result",
+      subtype: "error",
+      session_id: "claude-session-1",
+      is_error: true,
+      result: "Authentication required. Please log in at https://claude.ai/login",
+      usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+    };
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root, {
+      commandWriter: (commandPath) => writeFailingClaudeCommand(commandPath, { resultEvent }),
+    });
+
+    try {
+      const result = await execute({
+        runId: "run-auth-json",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("claude_auth_required");
+      expect(result.errorMessage).toContain("Claude Code is not logged in or its login has expired");
+      expect(result.errorMeta).toMatchObject({
+        category: "auth",
+        reason: "claude_auth_required",
+        status: "expired_or_missing",
+        loginUrl: "https://claude.ai/login",
+      });
+      expect(result.resultJson).toMatchObject({
+        errorCode: "claude_auth_required",
+        errorCategory: "auth",
+      });
+      expect(result.clearSession).toBe(false);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("logs HOME, CLAUDE_CONFIG_DIR, and the resolved executable path in invocation metadata", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-meta-"));
     const workspace = path.join(root, "workspace");

@@ -119,6 +119,22 @@ function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscri
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
 }
 
+function buildClaudeAuthRequiredMessage(loginUrl: string | null): string {
+  const loginHint = loginUrl
+    ? `Open ${loginUrl} or run \`claude login\` in the agent's execution environment`
+    : "Run `claude login` in the agent's execution environment";
+  return `Claude Code is not logged in or its login has expired. ${loginHint}, then rerun the heartbeat.`;
+}
+
+function buildClaudeAuthRequiredMeta(loginUrl: string | null): Record<string, unknown> {
+  return {
+    category: "auth",
+    reason: "claude_auth_required",
+    status: "expired_or_missing",
+    ...(loginUrl ? { loginUrl } : {}),
+  };
+}
+
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
   const { runId, agent, config, context, runtimeCommandSpec, executionTarget, authToken } = input;
   const onLog = input.onLog ?? (async () => {});
@@ -750,12 +766,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       stdout: proc.stdout,
       stderr: proc.stderr,
     });
-    const errorMeta =
-      loginMeta.loginUrl != null
-        ? {
-            loginUrl: loginMeta.loginUrl,
-          }
-        : undefined;
+    const errorMeta = loginMeta.requiresLogin
+      ? buildClaudeAuthRequiredMeta(loginMeta.loginUrl)
+      : loginMeta.loginUrl != null
+      ? { loginUrl: loginMeta.loginUrl }
+      : undefined;
 
     if (proc.timedOut) {
       return {
@@ -770,7 +785,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     if (!parsed) {
-      const fallbackErrorMessage = parseFallbackErrorMessage(proc);
+      const fallbackErrorMessage = loginMeta.requiresLogin
+        ? buildClaudeAuthRequiredMessage(loginMeta.loginUrl)
+        : parseFallbackErrorMessage(proc);
       const transientUpstream =
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
@@ -805,6 +822,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
+          ...(loginMeta.requiresLogin ? { errorCode: "claude_auth_required", errorCategory: "auth" } : {}),
           ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
           ...(transientRetryNotBefore
             ? { retryNotBefore: transientRetryNotBefore.toISOString() }
@@ -850,7 +868,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedIsError = asBoolean(parsed.is_error, false);
     const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
     const errorMessage = failed
-      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
+      ? loginMeta.requiresLogin
+        ? buildClaudeAuthRequiredMessage(loginMeta.loginUrl)
+        : describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
     const transientUpstream =
       failed &&
@@ -879,6 +899,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
+      ...(failed && loginMeta.requiresLogin ? { errorCode: "claude_auth_required", errorCategory: "auth" } : {}),
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
