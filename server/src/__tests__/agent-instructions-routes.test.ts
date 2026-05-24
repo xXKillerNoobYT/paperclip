@@ -81,7 +81,13 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(actor: Record<string, unknown> = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+}) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -89,13 +95,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", agentRoutes({} as any));
@@ -146,6 +146,13 @@ function makeAgent() {
     defaultEnvironmentId: null,
     permissions: null,
     updatedAt: new Date(),
+  };
+}
+
+function makeAgentWith(overrides: Record<string, unknown>) {
+  return {
+    ...makeAgent(),
+    ...overrides,
   };
 }
 
@@ -265,6 +272,110 @@ describe("agent instructions bundle routes", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it("allows an agent creator to write another agent's managed instructions file", async () => {
+    const targetAgent = makeAgentWith({
+      id: "11111111-1111-4111-8111-111111111111",
+      permissions: { canCreateAgents: false },
+    });
+    const governanceAgent = makeAgentWith({
+      id: "22222222-2222-4222-8222-222222222222",
+      role: "engineering-manager",
+      permissions: { canCreateAgents: true },
+    });
+    mockAgentService.getById.mockImplementation(async (id: string) => {
+      if (id === governanceAgent.id) return governanceAgent;
+      if (id === targetAgent.id) return targetAgent;
+      return null;
+    });
+
+    const res = await requestApp(
+      await createApp({
+        type: "agent",
+        agentId: governanceAgent.id,
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-1",
+      }),
+      (baseUrl) => request(baseUrl)
+        .put(`/api/agents/${targetAgent.id}/instructions-bundle/file?companyId=company-1`)
+        .send({
+          path: "AGENTS.md",
+          content: "# Updated Agent\n",
+          clearLegacyPromptTemplate: true,
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentInstructionsService.writeFile).toHaveBeenCalledWith(
+      expect.objectContaining({ id: targetAgent.id }),
+      "AGENTS.md",
+      "# Updated Agent\n",
+      { clearLegacyPromptTemplate: true },
+    );
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      targetAgent.id,
+      expect.objectContaining({
+        adapterConfig: expect.objectContaining({
+          instructionsBundleMode: "managed",
+          instructionsEntryFile: "AGENTS.md",
+        }),
+      }),
+      expect.objectContaining({
+        recordRevision: expect.objectContaining({
+          createdByAgentId: governanceAgent.id,
+          source: "instructions_bundle_file_put",
+        }),
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        actorType: "agent",
+        actorId: governanceAgent.id,
+        agentId: governanceAgent.id,
+        runId: "run-1",
+        action: "agent.instructions_file_updated",
+        entityId: targetAgent.id,
+      }),
+    );
+  });
+
+  it("blocks ordinary agents from writing instructions bundle files", async () => {
+    const targetAgent = makeAgentWith({
+      id: "11111111-1111-4111-8111-111111111111",
+    });
+    const ordinaryAgent = makeAgentWith({
+      id: "22222222-2222-4222-8222-222222222222",
+      permissions: { canCreateAgents: false },
+    });
+    mockAgentService.getById.mockImplementation(async (id: string) => {
+      if (id === ordinaryAgent.id) return ordinaryAgent;
+      if (id === targetAgent.id) return targetAgent;
+      return null;
+    });
+
+    const res = await requestApp(
+      await createApp({
+        type: "agent",
+        agentId: ordinaryAgent.id,
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-1",
+      }),
+      (baseUrl) => request(baseUrl)
+        .put(`/api/agents/${targetAgent.id}/instructions-bundle/file?companyId=company-1`)
+        .send({
+          path: "AGENTS.md",
+          content: "# Updated Agent\n",
+        }),
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Only CEO or agent creators");
+    expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it("preserves managed instructions config when switching adapters", async () => {
