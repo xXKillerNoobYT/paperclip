@@ -342,6 +342,45 @@ describe("agent instructions bundle routes", () => {
     );
   });
 
+  it("blocks governance agents from writing the legacy prompt template pseudo-file", async () => {
+    const targetAgent = makeAgentWith({
+      id: "11111111-1111-4111-8111-111111111111",
+      permissions: { canCreateAgents: false },
+    });
+    const governanceAgent = makeAgentWith({
+      id: "22222222-2222-4222-8222-222222222222",
+      role: "engineering-manager",
+      permissions: { canCreateAgents: true },
+    });
+    mockAgentService.getById.mockImplementation(async (id: string) => {
+      if (id === governanceAgent.id) return governanceAgent;
+      if (id === targetAgent.id) return targetAgent;
+      return null;
+    });
+
+    const res = await requestApp(
+      await createApp({
+        type: "agent",
+        agentId: governanceAgent.id,
+        companyId: "company-1",
+        source: "agent_key",
+        runId: "run-1",
+      }),
+      (baseUrl) => request(baseUrl)
+        .put(`/api/agents/${targetAgent.id}/instructions-bundle/file?companyId=company-1`)
+        .send({
+          path: "promptTemplate.legacy.md",
+          content: "# Updated legacy prompt\n",
+        }),
+    );
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("Only board-authenticated callers can update the legacy prompt template");
+    expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
   it("blocks ordinary agents from writing instructions bundle files", async () => {
     const targetAgent = makeAgentWith({
       id: "11111111-1111-4111-8111-111111111111",
