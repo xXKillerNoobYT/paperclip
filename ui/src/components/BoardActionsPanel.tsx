@@ -18,7 +18,7 @@ function itemLabel(count: number): string {
   return `${count} item${count === 1 ? "" : "s"}`;
 }
 
-export function BoardActionsPanel({ actions }: { actions: DashboardBoardAction[] }) {
+export function BoardActionsPanel({ actions = [] }: { actions?: DashboardBoardAction[] }) {
   const urgentCount = actions.filter((action) => action.severity === "critical").length;
 
   return (

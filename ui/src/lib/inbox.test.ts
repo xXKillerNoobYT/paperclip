@@ -295,6 +295,7 @@ const dashboard: DashboardSummary = {
     monthUtilizationPercent: 90,
   },
   pendingApprovals: 1,
+  boardActions: [],
   budgets: {
     activeIncidents: 0,
     pendingApprovals: 0,

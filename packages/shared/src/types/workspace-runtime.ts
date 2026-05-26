@@ -77,11 +77,24 @@ export interface ExecutionWorkspaceStrategy {
   teardownCommand?: string | null;
 }
 
+export type StewardBranchMutationAction = "delete" | "merge" | "force_push" | "rebase" | "push";
+
+export interface ExecutionWorkspaceBranchMutationGates {
+  requireCleanWorktree?: boolean;
+  requireKnownBase?: boolean;
+  requireLinkedIssue?: boolean;
+  requirePullRequestForMerge?: boolean;
+  branchCap?: number | null;
+  protectedBranches?: string[];
+  approvalRequiredFor?: StewardBranchMutationAction[];
+}
+
 export interface ExecutionWorkspaceBranchPolicy {
   syncBeforeStart?: boolean;
   syncBeforeReview?: boolean;
   deleteAfterMerge?: boolean;
   syncStrategy?: "rebase" | "merge";
+  mutationGates?: ExecutionWorkspaceBranchMutationGates | null;
   [key: string]: unknown;
 }
 
@@ -211,6 +224,25 @@ export interface ExecutionWorkspaceCloseReadiness {
   runtimeServices: WorkspaceRuntimeService[];
 }
 
+export interface ExecutionWorkspaceCleanupPolicy {
+  allowDestructiveCloseWithWarnings?: boolean;
+  requireStoppedRuntimeServices?: boolean;
+  requireNoActiveIssueOrRun?: boolean;
+  requireCloseReadinessNotBlocked?: boolean;
+  requireDirtyReviewRecorded?: boolean;
+  requireArchivePhaseCompleted?: boolean;
+  requireActivityEvidence?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ExecutionWorkspaceCodeOnlySyncPolicy {
+  enabled?: boolean;
+  ignoredGlobs?: string[];
+  secretGlobs?: string[];
+  allowedExceptionGlobs?: string[];
+  [key: string]: unknown;
+}
+
 export interface ProjectExecutionWorkspacePolicy {
   enabled: boolean;
   defaultMode?: ProjectExecutionWorkspaceDefaultMode;
@@ -224,7 +256,8 @@ export interface ProjectExecutionWorkspacePolicy {
   validationCommand?: string | null;
   validationPlatform?: ExecutionWorkspaceValidationPlatform | null;
   runtimePolicy?: Record<string, unknown> | null;
-  cleanupPolicy?: Record<string, unknown> | null;
+  cleanupPolicy?: ExecutionWorkspaceCleanupPolicy | null;
+  codeOnlySyncPolicy?: ExecutionWorkspaceCodeOnlySyncPolicy | null;
 }
 
 export interface IssueExecutionWorkspaceSettings {
