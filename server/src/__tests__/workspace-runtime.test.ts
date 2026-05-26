@@ -2139,6 +2139,38 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 10_000);
 
+  it("treats shared project-primary record-only archive cleanup as complete while keeping the directory", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-shared-record-only-"));
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: workspaceRoot,
+        providerType: "local_fs",
+        providerRef: null,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: {
+          createdByRuntime: false,
+        },
+      },
+      projectWorkspace: {
+        cwd: workspaceRoot,
+        cleanupCommand: null,
+      },
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toEqual([]);
+    await expect(fs.stat(workspaceRoot).then((stat) => stat.isDirectory())).resolves.toBe(true);
+
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  });
+
   it("records teardown and cleanup operations when a recorder is provided", async () => {
     const repoRoot = await createTempRepo();
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();

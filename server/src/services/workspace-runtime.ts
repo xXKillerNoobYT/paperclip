@@ -1739,6 +1739,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   ]
     .map((value) => asString(value, "").trim())
     .filter(Boolean);
+  let cleanupCommandFailed = false;
+  let artifactCleanupExpected = input.workspace.providerType === "git_worktree" && Boolean(workspacePath);
 
   for (const command of cleanupCommands) {
     try {
@@ -1762,6 +1764,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         successMessage: `Completed cleanup command "${command}"\n`,
       });
     } catch (err) {
+      cleanupCommandFailed = true;
       warnings.push(err instanceof Error ? err.message : String(err));
     }
   }
@@ -1816,6 +1819,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       }
     }
   } else if (input.workspace.providerType === "local_fs" && createdByRuntime && workspacePath) {
+    artifactCleanupExpected = true;
     const projectWorkspaceCwd = input.projectWorkspace?.cwd ? path.resolve(input.projectWorkspace.cwd) : null;
     const resolvedWorkspacePath = path.resolve(workspacePath);
     const containsProjectWorkspace = projectWorkspaceCwd
@@ -1847,9 +1851,11 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
-  const cleaned =
+  const artifactCleaned =
+    !artifactCleanupExpected ||
     !workspacePath ||
     !(await directoryExists(workspacePath));
+  const cleaned = artifactCleaned && !cleanupCommandFailed;
 
   return {
     cleanedPath: workspacePath,
