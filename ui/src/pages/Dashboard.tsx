@@ -20,12 +20,29 @@ import { ActivityRow } from "../components/ActivityRow";
 import { Identity } from "../components/Identity";
 import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
-import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
+import {
+  Bot,
+  CircleDot,
+  DollarSign,
+  LayoutDashboard,
+  PauseCircle,
+  RefreshCw,
+  ShieldCheck,
+} from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
+import { BoardActionsPanel } from "../components/BoardActionsPanel";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
 import type { Agent, Issue } from "@paperclipai/shared";
 import { PluginSlotOutlet } from "@/plugins/slots";
+import {
+  buildNowNextItems,
+  CurrentPhaseCard,
+  DashboardFreshnessFooter,
+  DashboardNowNextPanel,
+  sourceState,
+  type DashboardSourceDiagnostic,
+} from "../components/DashboardFreshness";
 
 const DASHBOARD_ACTIVITY_LIMIT = 10;
 
@@ -43,39 +60,44 @@ export function Dashboard() {
   const hydratedActivityRef = useRef(false);
   const activityAnimationTimersRef = useRef<number[]>([]);
 
-  const { data: agents } = useQuery({
+  const agentsQuery = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId!),
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const agents = agentsQuery.data;
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Dashboard" }]);
   }, [setBreadcrumbs]);
 
-  const { data, isLoading, error } = useQuery({
+  const dashboardQuery = useQuery({
     queryKey: queryKeys.dashboard(selectedCompanyId!),
     queryFn: () => dashboardApi.summary(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const { data, isLoading, error } = dashboardQuery;
 
-  const { data: activity } = useQuery({
+  const activityQuery = useQuery({
     queryKey: [...queryKeys.activity(selectedCompanyId!), { limit: DASHBOARD_ACTIVITY_LIMIT }],
     queryFn: () => activityApi.list(selectedCompanyId!, { limit: DASHBOARD_ACTIVITY_LIMIT }),
     enabled: !!selectedCompanyId,
   });
+  const activity = activityQuery.data;
 
-  const { data: issues } = useQuery({
+  const issuesQuery = useQuery({
     queryKey: queryKeys.issues.list(selectedCompanyId!),
     queryFn: () => issuesApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const issues = issuesQuery.data;
 
-  const { data: projects } = useQuery({
+  const projectsQuery = useQuery({
     queryKey: queryKeys.projects.list(selectedCompanyId!),
     queryFn: () => projectsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
   });
+  const projects = projectsQuery.data;
 
   const { data: companyMembers } = useQuery({
     queryKey: queryKeys.access.companyUserDirectory(selectedCompanyId!),
@@ -90,6 +112,58 @@ export function Dashboard() {
 
   const recentIssues = issues ? getRecentIssues(issues) : [];
   const recentActivity = useMemo(() => (activity ?? []).slice(0, 10), [activity]);
+  const nowNext = useMemo(() => buildNowNextItems(issues ?? [], agents), [issues, agents]);
+  const nowNextHasRows = nowNext.now.length > 0 || nowNext.next.length > 0;
+  const diagnostics = useMemo<DashboardSourceDiagnostic[]>(() => [
+    {
+      id: "now-next",
+      label: "Now & Next",
+      mode: "LIVE",
+      state: sourceState(issuesQuery),
+      lastGoodAt: issuesQuery.dataUpdatedAt || null,
+      cadence: "Auto refreshes with issue data",
+      nextAttempt: issuesQuery.isFetching ? "checking now" : "on window focus",
+      canRetry: issuesQuery.isError || sourceState(issuesQuery) === "stale",
+      retryLabel: issuesQuery.isFetching ? "Refreshing" : "Retry",
+      onRetry: () => { void issuesQuery.refetch(); },
+    },
+    {
+      id: "phase",
+      label: "Phase",
+      mode: "LIVE",
+      state: sourceState(dashboardQuery),
+      lastGoodAt: dashboardQuery.dataUpdatedAt || null,
+      cadence: "Auto refreshes with dashboard summary",
+      nextAttempt: dashboardQuery.isFetching ? "checking now" : "on window focus",
+      canRetry: dashboardQuery.isError || sourceState(dashboardQuery) === "stale",
+      retryLabel: dashboardQuery.isFetching ? "Refreshing" : "Retry",
+      onRetry: () => { void dashboardQuery.refetch(); },
+    },
+    {
+      id: "plan-tree",
+      label: "Plan Tree",
+      mode: "DAILY",
+      state: sourceState(projectsQuery),
+      lastGoodAt: projectsQuery.dataUpdatedAt || null,
+      cadence: "Daily snapshot, manual refresh allowed",
+      nextAttempt: projectsQuery.isFetching ? "checking now" : "next daily snapshot",
+      canRetry: !projectsQuery.isFetching,
+      retryLabel: projectsQuery.isFetching ? "Refreshing" : "Refresh",
+      onRetry: () => { void projectsQuery.refetch(); },
+    },
+    {
+      id: "area-progress",
+      label: "Area Progress",
+      mode: "DAILY",
+      state: sourceState(activityQuery),
+      lastGoodAt: activityQuery.dataUpdatedAt || null,
+      cadence: "Daily rollup, manual refresh allowed",
+      nextAttempt: activityQuery.isFetching ? "checking now" : "next daily rollup",
+      canRetry: !activityQuery.isFetching,
+      retryLabel: activityQuery.isFetching ? "Refreshing" : "Refresh",
+      onRetry: () => { void activityQuery.refetch(); },
+    },
+  ], [activityQuery, dashboardQuery, issuesQuery, projectsQuery]);
 
   useEffect(() => {
     for (const timer of activityAnimationTimersRef.current) {
@@ -306,12 +380,80 @@ export function Dashboard() {
             </ChartCard>
           </div>
 
+          <BoardActionsPanel actions={data.boardActions} />
+
           <PluginSlotOutlet
             slotTypes={["dashboardWidget"]}
             context={{ companyId: selectedCompanyId }}
             className="grid gap-4 md:grid-cols-2"
             itemClassName="rounded-lg border bg-card p-4 shadow-sm"
           />
+
+          <section className="space-y-4" aria-labelledby="now-next-heading">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 id="now-next-heading" className="text-base font-semibold">Now & Next</h2>
+                <p className="text-sm text-muted-foreground">Live issue flow with fetch-only refresh controls.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => { void issuesQuery.refetch(); }}
+                disabled={issuesQuery.isFetching}
+                className="inline-flex items-center gap-2 rounded-sm border border-border px-3 py-1.5 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <RefreshCw className={cn("h-4 w-4", issuesQuery.isFetching && "animate-spin")} />
+                {issuesQuery.isFetching ? "Refreshing" : "Refresh"}
+              </button>
+            </div>
+
+            <DashboardNowNextPanel
+              now={nowNext.now}
+              next={nowNext.next}
+              isLoading={issuesQuery.isLoading}
+              isError={issuesQuery.isError}
+              hasCachedRows={nowNextHasRows}
+              onRetry={() => { void issuesQuery.refetch(); }}
+            />
+
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+              <CurrentPhaseCard open={data.tasks.open} done={data.tasks.done} />
+              <section className="rounded-md border border-border p-4">
+                <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Plan Tree</h3>
+                {projectsQuery.isLoading ? (
+                  <div className="mt-3 space-y-2" aria-hidden="true">
+                    <div className="h-4 w-2/3 animate-pulse rounded-sm bg-muted" />
+                    <div className="h-4 w-1/2 animate-pulse rounded-sm bg-muted" />
+                    <div className="h-4 w-3/5 animate-pulse rounded-sm bg-muted" />
+                  </div>
+                ) : (projects ?? []).length === 0 ? (
+                  <p className="mt-2 text-sm text-muted-foreground">No plan tree available.</p>
+                ) : (
+                  <ul className="mt-3 space-y-2 text-sm">
+                    {(projects ?? []).slice(0, 3).map((project) => (
+                      <li key={project.id} className="flex min-w-0 items-center justify-between gap-3">
+                        <span className="truncate">{project.name}</span>
+                        <span className="shrink-0 rounded-sm border border-border px-1.5 py-0.5 text-[11px] uppercase text-muted-foreground">{project.status}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+            </div>
+
+            <section className="rounded-md border border-border p-4">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Area Progress</h3>
+              <div className="mt-3 grid gap-3 sm:grid-cols-4">
+                {(["inProgress", "blocked", "open", "done"] as const).map((key) => (
+                  <div key={key} className="min-w-0 rounded-md bg-muted/50 px-3 py-2">
+                    <p className="truncate text-xs uppercase tracking-wide text-muted-foreground">{key === "inProgress" ? "In progress" : key}</p>
+                    <p className="text-lg font-semibold">{data.tasks[key]}</p>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <DashboardFreshnessFooter diagnostics={diagnostics} />
+          </section>
 
           <div className="grid md:grid-cols-2 gap-4">
             {/* Recent Activity */}
