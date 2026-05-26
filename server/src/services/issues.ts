@@ -1274,6 +1274,7 @@ async function listIssueBlockerAttentionMap(
             eq(issues.companyId, companyId),
             inArray(issues.parentId, chunk),
             ne(issues.status, "done"),
+            ne(issues.status, "cancelled"),
           ),
         );
       const [explicitBlockerRows, childRows] = await Promise.all([
