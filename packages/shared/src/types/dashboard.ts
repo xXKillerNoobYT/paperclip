@@ -6,6 +6,24 @@ export interface DashboardRunActivityDay {
   total: number;
 }
 
+export interface DashboardBoardAction {
+  id: string;
+  kind: "approval" | "issue_thread_interaction" | "failed_run" | "join_request";
+  sourceType: "approval" | "issue_thread_interaction" | "failed_run" | "join_request";
+  severity: "info" | "warning" | "critical";
+  actionType: string;
+  sourceIssueId?: string | null;
+  sourceIssueIdentifier?: string | null;
+  sourceIssueTitle?: string | null;
+  title: string;
+  summary: string;
+  reason: string;
+  actionLabel: string;
+  href: string;
+  createdAt: Date | string;
+  updatedAt?: Date | string | null;
+}
+
 export interface DashboardSummary {
   companyId: string;
   agents: {
@@ -26,6 +44,7 @@ export interface DashboardSummary {
     monthUtilizationPercent: number;
   };
   pendingApprovals: number;
+  boardActions: DashboardBoardAction[];
   budgets: {
     activeIncidents: number;
     pendingApprovals: number;
