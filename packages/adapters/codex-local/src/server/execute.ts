@@ -104,6 +104,16 @@ async function isLikelyPaperclipRepoRoot(candidate: string): Promise<boolean> {
   return hasWorkspace && hasPackageJson && hasServerDir && hasAdapterUtilsDir;
 }
 
+async function isInsideGitCheckout(candidate: string): Promise<boolean> {
+  let cursor = path.resolve(candidate);
+  for (;;) {
+    if (await pathExists(path.join(cursor, ".git"))) return true;
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
+}
+
 async function isLikelyPaperclipRuntimeSkillPath(
   candidate: string,
   skillName: string,
@@ -658,6 +668,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "Added --skip-git-repo-check for sandbox execution because Codex requires an explicit trust bypass in headless remote workspaces.",
     );
   }
+  const skipGitRepoCheck = executionTargetIsSandbox || !(await isInsideGitCheckout(cwd));
+  if (!executionTargetIsSandbox && skipGitRepoCheck) {
+    commandNotes.push(
+      "Added --skip-git-repo-check because the resolved Paperclip workspace is not inside a git checkout.",
+    );
+  }
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const prompt = joinPromptSections([
@@ -682,7 +698,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       forceSaferInvocation ? { ...config, fastMode: false } : config,
       {
         resumeSessionId,
-        skipGitRepoCheck: executionTargetIsSandbox,
+        skipGitRepoCheck,
       },
     );
     const args = execArgs.args;
