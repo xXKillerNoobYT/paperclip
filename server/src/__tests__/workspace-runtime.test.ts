@@ -2146,6 +2146,42 @@ describe("realizeExecutionWorkspace", () => {
       workspace: {
         id: "execution-workspace-1",
         cwd: workspaceRoot,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        providerType: "local_fs",
+        providerRef: null,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: {
+          createdByRuntime: true,
+        },
+      },
+      projectWorkspace: {
+        cwd: workspaceRoot,
+        cleanupCommand: null,
+      },
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toEqual([]);
+    await expect(fs.stat(workspaceRoot).then((stat) => stat.isDirectory())).resolves.toBe(true);
+
+    await fs.rm(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("keeps failed cleanup commands as incomplete cleanup", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-cleanup-failure-"));
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: workspaceRoot,
+        mode: "isolated_workspace",
+        strategyType: "project_primary",
         providerType: "local_fs",
         providerRef: null,
         branchName: null,
@@ -2162,10 +2198,11 @@ describe("realizeExecutionWorkspace", () => {
         cwd: workspaceRoot,
         cleanupCommand: null,
       },
+      cleanupCommand: "exit 7",
     });
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toEqual([]);
+    expect(cleanup.cleaned).toBe(false);
+    expect(cleanup.warnings.length).toBeGreaterThan(0);
     await expect(fs.stat(workspaceRoot).then((stat) => stat.isDirectory())).resolves.toBe(true);
 
     await fs.rm(workspaceRoot, { recursive: true, force: true });

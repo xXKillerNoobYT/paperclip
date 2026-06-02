@@ -1701,6 +1701,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;
     cwd: string | null;
+    mode?: string | null;
+    strategyType?: string | null;
     providerType: string;
     providerRef: string | null;
     branchName: string | null;
@@ -1732,6 +1734,10 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     projectWorkspaceCwd: input.projectWorkspace?.cwd ?? null,
   });
   const createdByRuntime = input.workspace.metadata?.createdByRuntime === true;
+  const isRecordOnlyLocalFsArchive =
+    input.workspace.providerType === "local_fs" &&
+    input.workspace.mode === "shared_workspace" &&
+    input.workspace.strategyType === "project_primary";
   const cleanupCommands = [
     input.cleanupCommand ?? null,
     input.projectWorkspace?.cleanupCommand ?? null,
@@ -1818,7 +1824,12 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         }
       }
     }
-  } else if (input.workspace.providerType === "local_fs" && createdByRuntime && workspacePath) {
+  } else if (
+    input.workspace.providerType === "local_fs" &&
+    createdByRuntime &&
+    !isRecordOnlyLocalFsArchive &&
+    workspacePath
+  ) {
     artifactCleanupExpected = true;
     const projectWorkspaceCwd = input.projectWorkspace?.cwd ? path.resolve(input.projectWorkspace.cwd) : null;
     const resolvedWorkspacePath = path.resolve(workspacePath);
