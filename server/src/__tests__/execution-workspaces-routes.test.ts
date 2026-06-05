@@ -49,6 +49,7 @@ function createApp(db: any = {}) {
       companyIds: ["company-1"],
       source: "local_implicit",
       isInstanceAdmin: false,
+      runId: req.get("x-paperclip-run-id") ?? null,
     };
     next();
   });
@@ -174,5 +175,58 @@ describe.sequential("execution workspace routes", () => {
       existingWorkspace.id,
       expect.objectContaining({ status: "cleanup_failed" }),
     );
+  });
+
+  it("rejects malformed run IDs before archiving a workspace", async () => {
+    const now = new Date("2026-06-01T12:00:00.000Z");
+    const existingWorkspace = {
+      id: "execution-workspace-1",
+      companyId: "company-1",
+      projectId: null,
+      projectWorkspaceId: null,
+      sourceIssueId: "issue-1",
+      mode: "isolated_workspace",
+      strategyType: "manual",
+      name: "Issue workspace",
+      status: "active",
+      cwd: "/tmp/paperclip-issue-workspace",
+      repoUrl: null,
+      baseRef: "main",
+      branchName: null,
+      providerType: "local_fs",
+      providerRef: null,
+      derivedFromExecutionWorkspaceId: null,
+      lastUsedAt: now,
+      openedAt: now,
+      closedAt: null,
+      cleanupEligibleAt: null,
+      cleanupReason: null,
+      config: {
+        provisionCommand: null,
+        teardownCommand: null,
+        cleanupCommand: null,
+        workspaceRuntime: null,
+        desiredState: null,
+        serviceStates: null,
+      },
+      metadata: {},
+      runtimeServices: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    mockExecutionWorkspaceService.getById.mockResolvedValue(existingWorkspace);
+
+    const res = await request(createApp())
+      .patch(`/api/execution-workspaces/${existingWorkspace.id}`)
+      .set("x-paperclip-run-id", "not-a-uuid")
+      .send({ status: "archived" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Invalid X-Paperclip-Run-Id header");
+    expect(mockExecutionWorkspaceService.getCloseReadiness).not.toHaveBeenCalled();
+    expect(mockExecutionWorkspaceService.update).not.toHaveBeenCalled();
+    expect(mockWorkspaceRuntime.stopRuntimeServicesForExecutionWorkspace).not.toHaveBeenCalled();
+    expect(mockWorkspaceRuntime.cleanupExecutionWorkspaceArtifacts).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 });

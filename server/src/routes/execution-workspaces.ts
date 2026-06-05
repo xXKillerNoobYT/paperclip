@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { issues, projects, projectWorkspaces } from "@paperclipai/db";
 import {
   findWorkspaceCommandDefinition,
+  isUuidLike,
   matchWorkspaceRuntimeServiceToCommand,
   updateExecutionWorkspaceSchema,
   workspaceRuntimeControlTargetSchema,
@@ -30,8 +31,16 @@ import {
 } from "./workspace-command-authz.js";
 import { assertCanManageExecutionWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
 import { appendWithCap } from "../adapters/utils.js";
+import { badRequest } from "../errors.js";
 
 const WORKSPACE_CONTROL_OUTPUT_MAX_CHARS = 256 * 1024;
+
+function assertValidActorRunIdForWorkspaceMutation(req: Request) {
+  const runId = req.actor.runId ?? null;
+  if (runId && !isUuidLike(runId)) {
+    throw badRequest("Invalid X-Paperclip-Run-Id header");
+  }
+}
 
 export function executionWorkspaceRoutes(db: Db) {
   const router = Router();
@@ -446,6 +455,7 @@ export function executionWorkspaceRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, existing.companyId);
+    assertValidActorRunIdForWorkspaceMutation(req);
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectExecutionWorkspaceCommandPaths({
