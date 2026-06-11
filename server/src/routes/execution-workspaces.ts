@@ -564,14 +564,20 @@ export function executionWorkspaceRoutes(db: Db) {
           }),
         });
         cleanupWarnings = cleanupResult.warnings;
+        const cleanupReason =
+          cleanupWarnings.length > 0
+            ? cleanupWarnings.join(" | ")
+            : !cleanupResult.cleaned
+              ? `Workspace path ${cleanupResult.cleanedPath ?? "(unknown)"} still exists after cleanup.`
+              : null;
         const cleanupPatch: Record<string, unknown> = {
           closedAt,
-          cleanupReason: cleanupWarnings.length > 0 ? cleanupWarnings.join(" | ") : null,
+          cleanupReason,
         };
-        if (!cleanupResult.cleaned) {
+        if (cleanupResult.cleanupFailed || !cleanupResult.cleaned) {
           cleanupPatch.status = "cleanup_failed";
         }
-        if (cleanupResult.warnings.length > 0 || !cleanupResult.cleaned) {
+        if (cleanupResult.cleanupFailed || cleanupResult.warnings.length > 0 || !cleanupResult.cleaned) {
           workspace = (await svc.update(id, cleanupPatch)) ?? workspace;
         }
       } catch (error) {

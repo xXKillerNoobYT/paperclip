@@ -1325,6 +1325,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   recorder?: WorkspaceOperationRecorder | null;
 }) {
   const warnings: string[] = [];
+  let cleanupFailed = false;
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
   const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
     ? await resolveGitRepoRootForWorkspaceCleanup(
@@ -1367,6 +1368,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         successMessage: `Completed cleanup command "${command}"\n`,
       });
     } catch (err) {
+      cleanupFailed = true;
       warnings.push(err instanceof Error ? err.message : String(err));
     }
   }
@@ -1375,6 +1377,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     const worktreeExists = await directoryExists(workspacePath);
     if (worktreeExists) {
       if (!repoRoot) {
+        cleanupFailed = true;
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
       } else {
         try {
@@ -1392,12 +1395,14 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
             failureLabel: `git worktree remove ${workspacePath}`,
           });
         } catch (err) {
+          cleanupFailed = true;
           warnings.push(err instanceof Error ? err.message : String(err));
         }
       }
     }
     if (createdByRuntime && input.workspace.branchName) {
       if (!repoRoot) {
+        cleanupFailed = true;
         warnings.push(`Could not resolve git repo root to delete branch "${input.workspace.branchName}".`);
       } else {
         try {
@@ -1430,7 +1435,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         )
       : false;
     if (containsProjectWorkspace) {
-      warnings.push(`Refusing to remove path "${workspacePath}" because it contains the project workspace.`);
+      // Retaining project-root local_fs paths is the intended safe close behavior.
     } else {
       await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
       if (input.recorder) {
@@ -1454,11 +1459,13 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 
   const cleaned =
     !workspacePath ||
+    input.workspace.providerType === "local_fs" ||
     !(await directoryExists(workspacePath));
 
   return {
     cleanedPath: workspacePath,
     cleaned,
+    cleanupFailed,
     warnings,
   };
 }

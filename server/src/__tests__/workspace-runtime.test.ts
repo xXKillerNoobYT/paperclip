@@ -1976,6 +1976,72 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 10_000);
 
+  it("treats retained local_fs project-root paths as cleaned", async () => {
+    const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-fs-retain-"));
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: projectRoot,
+        providerType: "local_fs",
+        providerRef: projectRoot,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: {
+          createdByRuntime: true,
+        },
+      },
+      projectWorkspace: {
+        cwd: projectRoot,
+        cleanupCommand: null,
+      },
+    });
+
+    expect(cleanup).toMatchObject({
+      cleaned: true,
+      cleanupFailed: false,
+      warnings: [],
+    });
+    await expect(fs.stat(projectRoot)).resolves.toBeDefined();
+  });
+
+  it("marks cleanup command failures even when a local_fs path is retained", async () => {
+    const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-fs-cleanup-fail-"));
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: projectRoot,
+        providerType: "local_fs",
+        providerRef: projectRoot,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: {
+          createdByRuntime: true,
+        },
+      },
+      projectWorkspace: {
+        cwd: projectRoot,
+        cleanupCommand: null,
+      },
+      cleanupCommand: "node -e \"process.exit(7)\"",
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.cleanupFailed).toBe(true);
+    expect(cleanup.warnings).toHaveLength(1);
+    expect(cleanup.warnings[0]).toContain("failed with exit code 7");
+    await expect(fs.stat(projectRoot)).resolves.toBeDefined();
+  });
+
   it("records teardown and cleanup operations when a recorder is provided", async () => {
     const repoRoot = await createTempRepo();
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
