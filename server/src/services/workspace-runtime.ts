@@ -1371,6 +1371,8 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
     }
   }
 
+  let destructiveCleanupExpected = input.workspace.providerType === "git_worktree";
+
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
     const worktreeExists = await directoryExists(workspacePath);
     if (worktreeExists) {
@@ -1421,6 +1423,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       }
     }
   } else if (input.workspace.providerType === "local_fs" && createdByRuntime && workspacePath) {
+    destructiveCleanupExpected = true;
     const projectWorkspaceCwd = input.projectWorkspace?.cwd ? path.resolve(input.projectWorkspace.cwd) : null;
     const resolvedWorkspacePath = path.resolve(workspacePath);
     const containsProjectWorkspace = projectWorkspaceCwd
@@ -1453,6 +1456,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   }
 
   const cleaned =
+    !destructiveCleanupExpected ||
     !workspacePath ||
     !(await directoryExists(workspacePath));
 

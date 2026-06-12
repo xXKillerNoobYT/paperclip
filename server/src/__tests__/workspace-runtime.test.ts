@@ -1976,6 +1976,72 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 10_000);
 
+  it("treats shared local_fs workspaces not created by runtime as metadata-only cleanup", async () => {
+    const projectWorkspaceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-project-workspace-"));
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: projectWorkspaceCwd,
+        providerType: "local_fs",
+        providerRef: projectWorkspaceCwd,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: {
+          source: "task_session",
+          createdByRuntime: false,
+        },
+      },
+      projectWorkspace: {
+        cwd: projectWorkspaceCwd,
+        cleanupCommand: null,
+      },
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.cleanedPath).toBe(projectWorkspaceCwd);
+    expect(cleanup.warnings).toEqual([]);
+    await expect(fs.stat(projectWorkspaceCwd)).resolves.toMatchObject({
+      isDirectory: expect.any(Function),
+    });
+  });
+
+  it("removes local_fs workspaces created by runtime", async () => {
+    const projectWorkspaceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-project-workspace-"));
+    const runtimeWorkspaceCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-workspace-"));
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: runtimeWorkspaceCwd,
+        providerType: "local_fs",
+        providerRef: runtimeWorkspaceCwd,
+        branchName: null,
+        repoUrl: null,
+        baseRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-1",
+        metadata: {
+          createdByRuntime: true,
+        },
+      },
+      projectWorkspace: {
+        cwd: projectWorkspaceCwd,
+        cleanupCommand: null,
+      },
+    });
+
+    expect(cleanup.cleaned).toBe(true);
+    expect(cleanup.warnings).toEqual([]);
+    await expect(fs.stat(runtimeWorkspaceCwd)).rejects.toThrow();
+    await expect(fs.stat(projectWorkspaceCwd)).resolves.toMatchObject({
+      isDirectory: expect.any(Function),
+    });
+  });
+
   it("records teardown and cleanup operations when a recorder is provided", async () => {
     const repoRoot = await createTempRepo();
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
