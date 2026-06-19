@@ -523,6 +523,41 @@ function gitErrorIncludes(error: unknown, needle: string) {
   return message.toLowerCase().includes(needle.toLowerCase());
 }
 
+function parseRemoteTrackingRef(ref: string): { remote: string; branch: string } | null {
+  const trimmed = ref.trim();
+  const refsRemotesPrefix = "refs/remotes/";
+  const normalized = trimmed.startsWith(refsRemotesPrefix)
+    ? trimmed.slice(refsRemotesPrefix.length)
+    : trimmed;
+  const slashIndex = normalized.indexOf("/");
+  if (slashIndex <= 0 || slashIndex === normalized.length - 1) return null;
+  const remote = normalized.slice(0, slashIndex);
+  const branch = normalized.slice(slashIndex + 1);
+  if (!/^[A-Za-z0-9._-]+$/.test(remote)) return null;
+  return { remote, branch };
+}
+
+async function refreshRemoteTrackingBaseRef(repoRoot: string, baseRef: string): Promise<void> {
+  const remoteTracking = parseRemoteTrackingRef(baseRef);
+  if (!remoteTracking) return;
+
+  const remoteExists = await runGit(["remote", "get-url", remoteTracking.remote], repoRoot)
+    .then(() => true)
+    .catch(() => false);
+  if (!remoteExists) return;
+
+  await runGit([
+    "fetch",
+    "--prune",
+    remoteTracking.remote,
+    `+refs/heads/${remoteTracking.branch}:refs/remotes/${remoteTracking.remote}/${remoteTracking.branch}`,
+  ], repoRoot);
+}
+
+async function resolveBaseRefSha(repoRoot: string, baseRef: string): Promise<string | null> {
+  return await runGit(["rev-parse", "--verify", `${baseRef}^{commit}`], repoRoot).catch(() => null);
+}
+
 type GitWorktreeListEntry = {
   worktree: string;
   branch: string | null;
@@ -585,22 +620,28 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
 }
 
 async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
-  // Try the explicit remote HEAD first (set by git clone or git remote set-head)
+  await runGit(["remote", "set-head", "origin", "--auto"], repoRoot).catch(() => null);
+
+  // Try the explicit remote HEAD first (set by clone, remote set-head, or the fetch above).
   try {
     const remoteHead = await runGit(
       ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
       repoRoot,
     );
-    const branch = remoteHead?.startsWith("origin/") ? remoteHead.slice("origin/".length) : remoteHead;
-    if (branch) return branch;
+    if (remoteHead) {
+      await refreshRemoteTrackingBaseRef(repoRoot, remoteHead);
+      if (await resolveBaseRefSha(repoRoot, remoteHead)) return remoteHead;
+    }
   } catch {
-    // Not set — fall through to heuristic
+    // Not set — fall through to heuristic.
   }
 
-  // Fallback: check for common default branch names on the remote
-  for (const candidate of ["main", "master"]) {
+  // Prefer refreshed remote tracking refs over local branches so stale local
+  // main/master checkouts are not used as default execution-workspace bases.
+  for (const candidate of ["origin/main", "origin/master", "main", "master"]) {
     try {
-      await runGit(["rev-parse", "--verify", `refs/remotes/origin/${candidate}`], repoRoot);
+      await refreshRemoteTrackingBaseRef(repoRoot, candidate);
+      await runGit(["rev-parse", "--verify", `${candidate}^{commit}`], repoRoot);
       return candidate;
     } catch {
       // Not found — try next
@@ -608,6 +649,27 @@ async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   }
 
   return null;
+}
+
+function isTrackedPaperclipRuntimeArtifact(filePath: string) {
+  return filePath.startsWith(".paperclip/DerivedData-")
+    || filePath.startsWith(".paperclip/worktrees/")
+    || filePath.startsWith(".paperclip-sync");
+}
+
+async function assertCleanGitWorktreeBaseRef(repoRoot: string, baseRef: string) {
+  const output = await runGit(["ls-tree", "-r", "--name-only", `${baseRef}^{tree}`], repoRoot);
+  const pollutedPaths = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .filter(isTrackedPaperclipRuntimeArtifact);
+  if (pollutedPaths.length === 0) return;
+
+  throw new Error(
+    `Selected git worktree base ref "${baseRef}" contains tracked Paperclip runtime artifacts: ${pollutedPaths.slice(0, 10).join(", ")}. `
+    + "Remove these files from the base branch or configure workspaceStrategy.baseRef to a clean ref.",
+  );
 }
 
 async function directoryExists(value: string) {
@@ -1092,6 +1154,8 @@ export async function realizeExecutionWorkspace(input: {
     throw new Error(`Registered worktree for branch "${branchName}" at "${registeredBranchWorktree}" is not reusable${reason}.`);
   }
 
+  await assertCleanGitWorktreeBaseRef(repoRoot, baseRef);
+
   try {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
@@ -1112,6 +1176,7 @@ export async function realizeExecutionWorkspace(input: {
       throw error;
     }
     try {
+      await assertCleanGitWorktreeBaseRef(repoRoot, branchName);
       await recordGitOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["worktree", "add", worktreePath, branchName],
@@ -1236,7 +1301,14 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   await runGit(["worktree", "prune"], repoRoot).catch(() => {});
 
   let created = false;
+  const recordedBranchExists = Boolean(
+    await runGit(["rev-parse", "--verify", `${branchName}^{commit}`], repoRoot).catch(() => null),
+  );
   try {
+    if (!recordedBranchExists) {
+      throw new Error("invalid reference");
+    }
+    await assertCleanGitWorktreeBaseRef(repoRoot, branchName);
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", worktreePath, branchName],
@@ -1261,6 +1333,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
       throw error;
     }
     const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+    await assertCleanGitWorktreeBaseRef(repoRoot, baseRef);
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
