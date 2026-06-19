@@ -1791,10 +1791,10 @@ describe("realizeExecutionWorkspace", () => {
 
     expect(workspace.strategy).toBe("git_worktree");
     expect(workspace.created).toBe(true);
-    // The worktree should have been created successfully (baseRef resolved to "master")
+    // The worktree should have been created successfully (baseRef resolved to "origin/master")
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
-    expect(worktreeOp!.metadata!.baseRef).toBe("master");
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
   }, 10_000);
 
   it("auto-detects the default branch via symbolic-ref when origin/HEAD is set", async () => {
@@ -1825,7 +1825,7 @@ describe("realizeExecutionWorkspace", () => {
       config: {
         workspaceStrategy: {
           type: "git_worktree",
-          // No baseRef configured — should auto-detect "master" via symbolic-ref
+          // No baseRef configured — should auto-detect "origin/master" via symbolic-ref
         },
       },
       issue: {
@@ -1845,7 +1845,104 @@ describe("realizeExecutionWorkspace", () => {
     expect(workspace.created).toBe(true);
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
-    expect(worktreeOp!.metadata!.baseRef).toBe("master");
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
+  }, 10_000);
+
+  it("uses origin/HEAD over a stale local default branch when baseRef is not configured", async () => {
+    const repoRoot = await createTempRepo("master");
+    await fs.mkdir(path.join(repoRoot, ".paperclip"), { recursive: true });
+    await fs.writeFile(path.join(repoRoot, ".paperclip", "DerivedData-stale"), "stale local runtime state\n", "utf8");
+    await runGit(repoRoot, ["add", ".paperclip/DerivedData-stale"]);
+    await runGit(repoRoot, ["commit", "-m", "Track stale local runtime state"]);
+
+    const cleanReadme = "remote default branch is clean\n";
+    await fs.writeFile(path.join(repoRoot, "README.md"), cleanReadme, "utf8");
+    await runGit(repoRoot, ["rm", "-r", ".paperclip"]);
+    await runGit(repoRoot, ["add", "README.md"]);
+    await runGit(repoRoot, ["commit", "-m", "Clean remote default"]);
+    await runGit(repoRoot, ["branch", "-M", "main"]);
+
+    const bareRemote = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-origin-head-main-"));
+    await runGit(bareRemote, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", bareRemote]);
+    await runGit(repoRoot, ["push", "-u", "origin", "main"]);
+    await runGit(bareRemote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await runGit(repoRoot, ["fetch", "origin"]);
+    await runGit(repoRoot, ["remote", "set-head", "origin", "main"]);
+
+    await runGit(repoRoot, ["checkout", "-B", "master", "HEAD~1"]);
+
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: null,
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-909",
+        title: "Use clean origin default",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      recorder,
+    });
+
+    const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
+    expect(workspace.created).toBe(true);
+    expect(worktreeOp?.metadata?.baseRef).toBe("origin/main");
+    await expect(fs.stat(path.join(workspace.cwd, ".paperclip", "DerivedData-stale"))).rejects.toThrow();
+    await expect(fs.readFile(path.join(workspace.cwd, "README.md"), "utf8")).resolves.toBe(cleanReadme);
+  }, 10_000);
+
+  it("blocks creating a git worktree from a base ref with tracked Paperclip runtime artifacts", async () => {
+    const repoRoot = await createTempRepo("main");
+    await fs.mkdir(path.join(repoRoot, ".paperclip", "worktrees", "old-worktree"), { recursive: true });
+    await fs.writeFile(path.join(repoRoot, ".paperclip", "DerivedData-local"), "derived data\n", "utf8");
+    await fs.writeFile(path.join(repoRoot, ".paperclip", "worktrees", "old-worktree", "state.txt"), "runtime state\n", "utf8");
+    await fs.writeFile(path.join(repoRoot, ".paperclip-sync-state"), "sync state\n", "utf8");
+    await runGit(repoRoot, ["add", ".paperclip/DerivedData-local", ".paperclip/worktrees/old-worktree/state.txt", ".paperclip-sync-state"]);
+    await runGit(repoRoot, ["commit", "-m", "Track runtime artifacts"]);
+
+    await expect(
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: null,
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-910",
+          title: "Block polluted base ref",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      }),
+    ).rejects.toThrow(/Selected git worktree base ref "main" contains tracked Paperclip runtime artifacts: .*\.paperclip\/DerivedData-local.*\.paperclip\/worktrees\/old-worktree\/state\.txt/);
   }, 10_000);
 
   it("removes a created git worktree and branch during cleanup", async () => {

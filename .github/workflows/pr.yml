@@ -121,7 +121,9 @@ jobs:
         run: pnpm build
 
       - name: Install Playwright
-        run: npx playwright install --with-deps chromium
+        run: |
+          npx playwright install-deps chromium
+          google-chrome --version
 
       - name: Generate Paperclip config
         run: |
@@ -141,6 +143,7 @@ jobs:
       - name: Run e2e tests
         env:
           PAPERCLIP_E2E_SKIP_LLM: "true"
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome
         run: pnpm run test:e2e
 
       - name: Upload Playwright report
