@@ -592,7 +592,7 @@ async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
       repoRoot,
     );
     const branch = remoteHead?.startsWith("origin/") ? remoteHead.slice("origin/".length) : remoteHead;
-    if (branch) return branch;
+    if (branch) return `origin/${branch}`;
   } catch {
     // Not set — fall through to heuristic
   }
@@ -601,13 +601,50 @@ async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   for (const candidate of ["main", "master"]) {
     try {
       await runGit(["rev-parse", "--verify", `refs/remotes/origin/${candidate}`], repoRoot);
-      return candidate;
+      return `origin/${candidate}`;
     } catch {
       // Not found — try next
     }
   }
 
   return null;
+}
+
+function isHeadLikeRef(ref: string | null | undefined): boolean {
+  return !ref || ref.trim().length === 0 || ref.trim() === "HEAD";
+}
+
+async function resolveExecutionWorkspaceBaseRef(repoRoot: string, configuredBaseRef: string | null): Promise<string> {
+  if (!isHeadLikeRef(configuredBaseRef)) {
+    return configuredBaseRef!.trim();
+  }
+  return await detectDefaultBranch(repoRoot) ?? "HEAD";
+}
+
+async function fetchRemoteBaseRef(repoRoot: string, baseRef: string): Promise<void> {
+  const [remote, ...branchParts] = baseRef.split("/");
+  if (!remote || branchParts.length === 0) return;
+  const branch = branchParts.join("/");
+  await runGit(["fetch", remote, branch], repoRoot).catch(() => undefined);
+}
+
+const TRACKED_RUNTIME_ARTIFACT_PREFIXES = [
+  ".paperclip/DerivedData/",
+  ".paperclip/worktrees/",
+  ".paperclip-sync/",
+];
+
+async function assertNoTrackedRuntimeArtifacts(repoRoot: string, ref: string, label: string): Promise<void> {
+  const output = await runGit(["ls-tree", "-r", "--name-only", ref, "--", ".paperclip", ".paperclip-sync"], repoRoot)
+    .catch(() => "");
+  const trackedArtifacts = output
+    .split("\n")
+    .map((entry) => entry.trim())
+    .filter((entry) => TRACKED_RUNTIME_ARTIFACT_PREFIXES.some((prefix) => entry.startsWith(prefix)));
+  if (trackedArtifacts.length === 0) return;
+  throw new Error(
+    `Ref "${ref}" for ${label} contains tracked Paperclip runtime artifacts that cannot be copied into execution worktrees: ${trackedArtifacts.slice(0, 10).join(", ")}${trackedArtifacts.length > 10 ? `, and ${trackedArtifacts.length - 10} more` : ""}. Remove these generated artifacts from the base branch before creating worktrees.`,
+  );
 }
 
 async function directoryExists(value: string) {
@@ -1016,10 +1053,10 @@ export async function realizeExecutionWorkspace(input: {
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
     : input.base.repoRef ?? null;
-  const baseRef = configuredBaseRef
-    ?? await detectDefaultBranch(repoRoot)
-    ?? "HEAD";
+  const baseRef = await resolveExecutionWorkspaceBaseRef(repoRoot, configuredBaseRef);
 
+  await fetchRemoteBaseRef(repoRoot, baseRef);
+  await assertNoTrackedRuntimeArtifacts(repoRoot, baseRef, "execution workspace base");
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
   async function reuseExistingWorktree(reusablePath: string) {
@@ -1260,7 +1297,9 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     ) {
       throw error;
     }
-    const baseRef = input.workspace.baseRef ?? await detectDefaultBranch(repoRoot) ?? "HEAD";
+    const baseRef = await resolveExecutionWorkspaceBaseRef(repoRoot, input.workspace.baseRef ?? input.base.repoRef ?? null);
+    await fetchRemoteBaseRef(repoRoot, baseRef);
+    await assertNoTrackedRuntimeArtifacts(repoRoot, baseRef, "restored execution workspace base");
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],

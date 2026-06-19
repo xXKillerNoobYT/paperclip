@@ -372,6 +372,89 @@ describe("realizeExecutionWorkspace", () => {
     expect(second.branchName).toBe(first.branchName);
   });
 
+  it("bases new worktrees on refreshed remote trunk when the project ref is HEAD and local checkout is stale", async () => {
+    const repoRoot = await createTempRepo();
+    const remoteRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-remote-"));
+    await runGit(remoteRoot, ["init", "--bare"]);
+    await runGit(repoRoot, ["remote", "add", "origin", remoteRoot]);
+    await runGit(repoRoot, ["push", "-u", "origin", "main"]);
+    await runGit(repoRoot, ["remote", "set-head", "origin", "main"]);
+
+    await runGit(repoRoot, ["checkout", "-b", "stale-local-main"]);
+    await fs.mkdir(path.join(repoRoot, ".paperclip", "DerivedData"), { recursive: true });
+    await fs.writeFile(path.join(repoRoot, ".paperclip", "DerivedData", "stale.txt"), "stale\n", "utf8");
+    await runGit(repoRoot, ["add", ".paperclip/DerivedData/stale.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Add stale local runtime artifact"]);
+
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-909",
+        identifier: "PAP-909",
+        title: "Prevent stale local main from polluting worktrees",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      recorder,
+    });
+
+    expect(realized.created).toBe(true);
+    await expect(fs.stat(path.join(realized.cwd, ".paperclip", "DerivedData", "stale.txt"))).rejects.toThrow();
+    expect(operations.find((operation) => operation.phase === "worktree_prepare")?.metadata?.baseRef).toBe("origin/main");
+  });
+
+  it("blocks worktree creation when the selected base ref tracks Paperclip runtime artifacts", async () => {
+    const repoRoot = await createTempRepo();
+    await fs.mkdir(path.join(repoRoot, ".paperclip", "worktrees", "bad"), { recursive: true });
+    await fs.writeFile(path.join(repoRoot, ".paperclip", "worktrees", "bad", "artifact.txt"), "bad\n", "utf8");
+    await runGit(repoRoot, ["add", ".paperclip/worktrees/bad/artifact.txt"]);
+    await runGit(repoRoot, ["commit", "-m", "Track runtime artifact"]);
+
+    await expect(realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-909",
+        identifier: "PAP-909",
+        title: "Prevent tracked runtime artifacts",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    })).rejects.toThrow(/contains tracked Paperclip runtime artifacts/);
+  });
+
   it("rejects reusing an empty directory that only looks like a worktree because it sits inside the repo", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-447-add-worktree-support";
@@ -1791,10 +1874,10 @@ describe("realizeExecutionWorkspace", () => {
 
     expect(workspace.strategy).toBe("git_worktree");
     expect(workspace.created).toBe(true);
-    // The worktree should have been created successfully (baseRef resolved to "master")
+    // The worktree should have been created successfully (baseRef resolved to the remote-tracking default branch)
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
-    expect(worktreeOp!.metadata!.baseRef).toBe("master");
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
   }, 10_000);
 
   it("auto-detects the default branch via symbolic-ref when origin/HEAD is set", async () => {
@@ -1845,7 +1928,7 @@ describe("realizeExecutionWorkspace", () => {
     expect(workspace.created).toBe(true);
     const worktreeOp = operations.find(op => op.phase === "worktree_prepare" && op.metadata?.created);
     expect(worktreeOp).toBeDefined();
-    expect(worktreeOp!.metadata!.baseRef).toBe("master");
+    expect(worktreeOp!.metadata!.baseRef).toBe("origin/master");
   }, 10_000);
 
   it("removes a created git worktree and branch during cleanup", async () => {
