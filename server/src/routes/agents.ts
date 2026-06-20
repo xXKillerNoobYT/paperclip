@@ -152,6 +152,7 @@ export function agentRoutes(
     "instructionsFilePath",
     "agentsMdPath",
   ] as const;
+  const LEGACY_PROMPT_TEMPLATE_PATH = "promptTemplate.legacy.md";
 
   const router = Router();
   const svc = agentService(db);
@@ -973,6 +974,38 @@ export function agentRoutes(
       );
     }
     await assertBoardCanManageAgentsForCompany(req, targetAgent.companyId);
+  }
+
+  async function assertCanWriteManagedInstructionsFile(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    relativePath: string,
+  ) {
+    assertCompanyAccess(req, targetAgent.companyId);
+    if (req.actor.type === "board") {
+      await assertBoardCanManageAgentsForCompany(req, targetAgent.companyId);
+      return;
+    }
+    if (relativePath === LEGACY_PROMPT_TEMPLATE_PATH) {
+      throw forbidden("Only board-authenticated callers can update the legacy prompt template");
+    }
+    if (!req.actor.agentId) throw forbidden("Agent authentication required");
+
+    const actorAgent = await svc.getById(req.actor.agentId);
+    if (!actorAgent || actorAgent.companyId !== targetAgent.companyId) {
+      throw forbidden("Agent key cannot access another company");
+    }
+    if (actorAgent.id === targetAgent.id) {
+      throw forbidden("Agent-authenticated callers cannot manage their own instructions bundle");
+    }
+    const allowedByGrant = await access.hasPermission(
+      targetAgent.companyId,
+      "agent",
+      actorAgent.id,
+      "agents:create",
+    );
+    if (actorAgent.role === "ceo" || allowedByGrant || canCreateAgents(actorAgent)) return;
+    throw forbidden("Only CEO or agent creators can manage other agents' instructions bundle files");
   }
 
   function assertNoAgentInstructionsConfigMutation(
@@ -2273,7 +2306,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanManageInstructionsPath(req, existing);
+    await assertCanWriteManagedInstructionsFile(req, existing, req.body.path);
 
     const actor = getActorInfo(req);
     const result = await instructions.writeFile(existing, req.body.path, req.body.content, {
