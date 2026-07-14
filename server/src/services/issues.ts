@@ -1840,6 +1840,7 @@ function summarizeIssueRelationRow(row: IssueRelationSummaryRow): IssueRelationI
 
 async function terminalExplicitBlockersByRoot(
   companyId: string,
+  sourceIssueIds: string[],
   roots: IssueRelationIssueSummary[],
   dbOrTx: DbReader,
 ): Promise<Map<string, IssueRelationIssueSummary[]>> {
@@ -1852,7 +1853,12 @@ async function terminalExplicitBlockersByRoot(
   for (const root of roots) nodesById.set(root.id, root);
 
   let frontier = rootIds;
-  let truncated = nodesById.size > BLOCKER_ATTENTION_MAX_NODES;
+  // Count the original issues and every blocker reached from them exactly once.
+  // Direct blockers can also be source roots in bulk reads, so nodesById alone
+  // would make the budget depend on which response shape requested the graph.
+  const budgetNodeIds = new Set(sourceIssueIds);
+  for (const rootId of rootIds) budgetNodeIds.add(rootId);
+  let truncated = budgetNodeIds.size > BLOCKER_ATTENTION_MAX_NODES;
   while (frontier.length > 0 && !truncated) {
     const nextFrontier = new Set<string>();
     for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
@@ -1885,11 +1891,14 @@ async function terminalExplicitBlockersByRoot(
           existingEdges.push(row.relatedId);
           edgesByIssueId.set(row.currentIssueId, existingEdges);
         }
-        if (!nodesById.has(row.relatedId)) {
-          if (nodesById.size >= BLOCKER_ATTENTION_MAX_NODES) {
+        if (!budgetNodeIds.has(row.relatedId)) {
+          if (budgetNodeIds.size >= BLOCKER_ATTENTION_MAX_NODES) {
             truncated = true;
             continue;
           }
+          budgetNodeIds.add(row.relatedId);
+        }
+        if (!nodesById.has(row.relatedId)) {
           nodesById.set(row.relatedId, summarizeIssueRelationRow(row));
           nextFrontier.add(row.relatedId);
         }
@@ -2057,7 +2066,8 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) nodesById.set(root.id, { ...root });
 
   let frontier = roots.map((root) => root.id);
-  let truncated = nodesById.size > BLOCKER_ATTENTION_MAX_NODES;
+  const budgetNodeIds = new Set(frontier);
+  let truncated = budgetNodeIds.size > BLOCKER_ATTENTION_MAX_NODES;
   while (frontier.length > 0 && !truncated) {
     const nextFrontier = new Set<string>();
 
@@ -2124,11 +2134,15 @@ async function listIssueBlockerAttentionMap(
       ]);
 
       for (const row of [...explicitBlockerRows, ...childRows]) {
-        if (!row.issueId || nodesById.has(row.blockerIssueId)) continue;
-        if (nodesById.size >= BLOCKER_ATTENTION_MAX_NODES) {
-          truncated = true;
-          continue;
+        if (!row.issueId) continue;
+        if (!budgetNodeIds.has(row.blockerIssueId)) {
+          if (budgetNodeIds.size >= BLOCKER_ATTENTION_MAX_NODES) {
+            truncated = true;
+            continue;
+          }
+          budgetNodeIds.add(row.blockerIssueId);
         }
+        if (nodesById.has(row.blockerIssueId)) continue;
         nodesById.set(row.blockerIssueId, {
           id: row.blockerIssueId,
           companyId: row.companyId,
@@ -4209,6 +4223,7 @@ export function issueService(db: Db) {
 
     const terminalByRoot = await terminalExplicitBlockersByRoot(
       companyId,
+      uniqueIssueIds,
       [...empty.values()].flatMap((relations) => relations.blockedBy),
       dbOrTx,
     );
