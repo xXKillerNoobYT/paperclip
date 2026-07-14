@@ -2547,10 +2547,21 @@ export function issueRoutes(
   }
 
   async function isCommentAttributedToAssigneeRun(
-    issue: { id: string; companyId: string; assigneeAgentId?: string | null },
+    issue: {
+      id: string;
+      companyId: string;
+      assigneeAgentId?: string | null;
+      executionRunId?: string | null;
+    },
     actor: ReturnType<typeof getActorInfo>,
   ) {
-    if (!actor.runId || !issue.assigneeAgentId) return false;
+    if (
+      actor.actorType !== "user" ||
+      actor.actorSource !== "local_implicit" ||
+      !actor.runId ||
+      !issue.assigneeAgentId ||
+      issue.executionRunId !== actor.runId
+    ) return false;
 
     const run = await heartbeat.getRun(actor.runId).catch((err) => {
       logger.warn(
@@ -2562,7 +2573,8 @@ export function issueRoutes(
     if (
       !run ||
       run.companyId !== issue.companyId ||
-      run.agentId !== issue.assigneeAgentId
+      run.agentId !== issue.assigneeAgentId ||
+      run.status !== "running"
     ) return false;
 
     const context = run.contextSnapshot && typeof run.contextSnapshot === "object"

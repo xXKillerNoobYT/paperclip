@@ -183,7 +183,9 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(
+  actorSource: "local_implicit" | "session" | "board_key" | "cloud_tenant" = "local_implicit",
+) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -195,7 +197,7 @@ async function createApp() {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
-      source: "local_implicit",
+      source: actorSource,
       isInstanceAdmin: false,
       runId: req.header("x-paperclip-run-id") ?? undefined,
     };
@@ -486,9 +488,11 @@ describe("issue update comment wakeups", () => {
   });
 
   it("does not wake the assignee for board-shaped issue update comments attributed to its run", async () => {
+    const runId = "aaaaaaaa-0000-4000-8000-000000000001";
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
+      executionRunId: runId,
       status: "in_progress",
     });
     mockIssueService.getById.mockResolvedValue(existing);
@@ -500,31 +504,112 @@ describe("issue update comment wakeups", () => {
       body: "run-authored progress update",
     });
     mockHeartbeatService.getRun.mockResolvedValue({
-      id: "aaaaaaaa-0000-4000-8000-000000000001",
+      id: runId,
       companyId: existing.companyId,
       agentId: ASSIGNEE_AGENT_ID,
+      status: "running",
       contextSnapshot: { issueId: existing.id },
     } as never);
 
     const res = await request(await createApp())
       .patch(`/api/issues/${existing.id}`)
-      .set("X-Paperclip-Run-Id", "aaaaaaaa-0000-4000-8000-000000000001")
+      .set("X-Paperclip-Run-Id", runId)
       .send({ comment: "run-authored progress update" });
 
     expect(res.status).toBe(200);
-    expect(mockHeartbeatService.getRun).toHaveBeenCalledWith("aaaaaaaa-0000-4000-8000-000000000001");
+    expect(mockHeartbeatService.getRun).toHaveBeenCalledWith(runId);
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["session", "board_key", "cloud_tenant"] as const)(
+    "wakes for PATCH comments when a %s actor replays the current run ID",
+    async (actorSource) => {
+      const runId = "aaaaaaaa-0000-4000-8000-000000000006";
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        executionRunId: runId,
+        status: "in_progress",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.update.mockResolvedValue({ ...existing });
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-replayed-run-patch",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: "genuine board feedback",
+      });
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: runId,
+        companyId: existing.companyId,
+        agentId: ASSIGNEE_AGENT_ID,
+        status: "running",
+        contextSnapshot: { issueId: existing.id },
+      } as never);
+
+      const res = await request(await createApp(actorSource))
+        .patch(`/api/issues/${existing.id}`)
+        .set("X-Paperclip-Run-Id", runId)
+        .send({ comment: "genuine board feedback" });
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        ASSIGNEE_AGENT_ID,
+        expect.objectContaining({ reason: "issue_commented" }),
+      );
+    },
+  );
+
+  it.each([
+    ["completed", "succeeded", "aaaaaaaa-0000-4000-8000-000000000007"],
+    ["stale", "running", "bbbbbbbb-0000-4000-8000-000000000007"],
+  ] as const)("fails open and wakes for a %s run on PATCH comments", async (_label, status, executionRunId) => {
+    const runId = "aaaaaaaa-0000-4000-8000-000000000007";
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      executionRunId,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue({ ...existing });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-stale-run-patch",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "genuine board feedback",
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: runId,
+      companyId: existing.companyId,
+      agentId: ASSIGNEE_AGENT_ID,
+      status,
+      contextSnapshot: { issueId: existing.id },
+    } as never);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .set("X-Paperclip-Run-Id", runId)
+      .send({ comment: "genuine board feedback" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_commented" }),
+    );
   });
 
   it.each([
     ["unknown run", null],
-    ["cross-company run", { companyId: "company-2", agentId: ASSIGNEE_AGENT_ID, contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } }],
-    ["cross-issue run", { companyId: "company-1", agentId: ASSIGNEE_AGENT_ID, contextSnapshot: { issueId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } }],
-    ["mismatched-agent run", { companyId: "company-1", agentId: PREVIOUS_AGENT_ID, contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } }],
+    ["cross-company run", { companyId: "company-2", agentId: ASSIGNEE_AGENT_ID, status: "running", contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } }],
+    ["cross-issue run", { companyId: "company-1", agentId: ASSIGNEE_AGENT_ID, status: "running", contextSnapshot: { issueId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } }],
+    ["mismatched-agent run", { companyId: "company-1", agentId: PREVIOUS_AGENT_ID, status: "running", contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } }],
   ])("fails closed and wakes for a board-shaped comment with an %s", async (_label, run) => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
+      executionRunId: "aaaaaaaa-0000-4000-8000-000000000002",
       status: "in_progress",
     });
     mockIssueService.getById.mockResolvedValue(existing);
@@ -595,9 +680,11 @@ describe("issue update comment wakeups", () => {
   });
 
   it("does not wake the assignee for board-shaped top-level comments attributed to its run", async () => {
+    const runId = "aaaaaaaa-0000-4000-8000-000000000003";
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
+      executionRunId: runId,
       status: "in_progress",
     });
     mockIssueService.getById.mockResolvedValue(existing);
@@ -608,32 +695,113 @@ describe("issue update comment wakeups", () => {
       body: "run-authored closeout",
     });
     mockHeartbeatService.getRun.mockResolvedValue({
-      id: "aaaaaaaa-0000-4000-8000-000000000003",
+      id: runId,
       companyId: existing.companyId,
       agentId: ASSIGNEE_AGENT_ID,
+      status: "running",
       contextSnapshot: { taskId: existing.id },
     } as never);
 
     const res = await request(await createApp())
       .post(`/api/issues/${existing.id}/comments`)
-      .set("X-Paperclip-Run-Id", "aaaaaaaa-0000-4000-8000-000000000003")
+      .set("X-Paperclip-Run-Id", runId)
       .send({ body: "run-authored closeout" });
 
     expect(res.status).toBe(201);
     await vi.waitFor(() => expect(mockHeartbeatService.getRun).toHaveBeenCalled());
-    expect(mockHeartbeatService.getRun).toHaveBeenCalledWith("aaaaaaaa-0000-4000-8000-000000000003");
+    expect(mockHeartbeatService.getRun).toHaveBeenCalledWith(runId);
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["session", "board_key", "cloud_tenant"] as const)(
+    "wakes for POST comments when a %s actor replays the current run ID",
+    async (actorSource) => {
+      const runId = "aaaaaaaa-0000-4000-8000-000000000008";
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        executionRunId: runId,
+        status: "in_progress",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-replayed-run-post",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: "genuine board feedback",
+      });
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: runId,
+        companyId: existing.companyId,
+        agentId: ASSIGNEE_AGENT_ID,
+        status: "running",
+        contextSnapshot: { issueId: existing.id },
+      } as never);
+
+      const res = await request(await createApp(actorSource))
+        .post(`/api/issues/${existing.id}/comments`)
+        .set("X-Paperclip-Run-Id", runId)
+        .send({ body: "genuine board feedback" });
+
+      expect(res.status).toBe(201);
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+      expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        ASSIGNEE_AGENT_ID,
+        expect.objectContaining({ reason: "issue_commented" }),
+      );
+    },
+  );
+
+  it.each([
+    ["completed", "succeeded", "aaaaaaaa-0000-4000-8000-000000000009"],
+    ["stale", "running", "bbbbbbbb-0000-4000-8000-000000000009"],
+  ] as const)("fails open and wakes for a %s run on POST comments", async (_label, status, executionRunId) => {
+    const runId = "aaaaaaaa-0000-4000-8000-000000000009";
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      executionRunId,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-stale-run-post",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "genuine board feedback",
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: runId,
+      companyId: existing.companyId,
+      agentId: ASSIGNEE_AGENT_ID,
+      status,
+      contextSnapshot: { issueId: existing.id },
+    } as never);
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .set("X-Paperclip-Run-Id", runId)
+      .send({ body: "genuine board feedback" });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_commented" }),
+    );
   });
 
   it.each([
     ["unknown run", null],
-    ["cross-company run", { companyId: "company-2", agentId: ASSIGNEE_AGENT_ID, contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } }],
-    ["cross-issue run", { companyId: "company-1", agentId: ASSIGNEE_AGENT_ID, contextSnapshot: { issueId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } }],
-    ["mismatched-agent run", { companyId: "company-1", agentId: PREVIOUS_AGENT_ID, contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } }],
+    ["cross-company run", { companyId: "company-2", agentId: ASSIGNEE_AGENT_ID, status: "running", contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } }],
+    ["cross-issue run", { companyId: "company-1", agentId: ASSIGNEE_AGENT_ID, status: "running", contextSnapshot: { issueId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } }],
+    ["mismatched-agent run", { companyId: "company-1", agentId: PREVIOUS_AGENT_ID, status: "running", contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" } }],
   ])("fails open and wakes for a board-shaped top-level comment with an %s", async (_label, run) => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
+      executionRunId: "aaaaaaaa-0000-4000-8000-000000000004",
       status: "in_progress",
     });
     mockIssueService.getById.mockResolvedValue(existing);
@@ -663,6 +831,7 @@ describe("issue update comment wakeups", () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
+      executionRunId: "aaaaaaaa-0000-4000-8000-000000000005",
       status: "in_progress",
     });
     const lookupError = new Error("run lookup failed");
