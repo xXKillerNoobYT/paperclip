@@ -2156,7 +2156,10 @@ async function listIssueBlockerAttentionMap(
         });
         nextFrontier.add(row.blockerIssueId);
       }
-      if (truncated) break;
+      // Once the node budget is exhausted, keep scanning the current frontier.
+      // Bulk reads may have already budgeted nodes in later chunks, and their
+      // edges must still be recorded so response shape cannot change counts.
+      // The truncated flag prevents admitting nodes and expanding another wave.
     }
 
     frontier = [...nextFrontier];
