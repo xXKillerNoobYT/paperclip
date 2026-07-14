@@ -1628,7 +1628,6 @@ function lowTrustBoundaryIssueCondition(
 }
 
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
-const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
 
@@ -1853,7 +1852,8 @@ async function terminalExplicitBlockersByRoot(
   for (const root of roots) nodesById.set(root.id, root);
 
   let frontier = rootIds;
-  for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
+  let truncated = nodesById.size > BLOCKER_ATTENTION_MAX_NODES;
+  while (frontier.length > 0 && !truncated) {
     const nextFrontier = new Set<string>();
     for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
       const rows = await dbOrTx
@@ -1886,15 +1886,23 @@ async function terminalExplicitBlockersByRoot(
           edgesByIssueId.set(row.currentIssueId, existingEdges);
         }
         if (!nodesById.has(row.relatedId)) {
+          if (nodesById.size >= BLOCKER_ATTENTION_MAX_NODES) {
+            truncated = true;
+            continue;
+          }
           nodesById.set(row.relatedId, summarizeIssueRelationRow(row));
           nextFrontier.add(row.relatedId);
         }
       }
+      if (truncated) break;
     }
 
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) break;
     frontier = [...nextFrontier];
   }
+
+  // A partial graph cannot identify a true terminal blocker. Omitting nested
+  // terminal expansion is safer than presenting the budget boundary as a leaf.
+  if (truncated) return terminalByRoot;
 
   const collectTerminal = (issueId: string, seen: Set<string>): IssueRelationIssueSummary[] => {
     if (seen.has(issueId)) return [];
@@ -2049,8 +2057,8 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) nodesById.set(root.id, { ...root });
 
   let frontier = roots.map((root) => root.id);
-  let truncated = false;
-  for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
+  let truncated = nodesById.size > BLOCKER_ATTENTION_MAX_NODES;
+  while (frontier.length > 0 && !truncated) {
     const nextFrontier = new Set<string>();
 
     for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
@@ -2117,6 +2125,10 @@ async function listIssueBlockerAttentionMap(
 
       for (const row of [...explicitBlockerRows, ...childRows]) {
         if (!row.issueId || nodesById.has(row.blockerIssueId)) continue;
+        if (nodesById.size >= BLOCKER_ATTENTION_MAX_NODES) {
+          truncated = true;
+          continue;
+        }
         nodesById.set(row.blockerIssueId, {
           id: row.blockerIssueId,
           companyId: row.companyId,
@@ -2130,15 +2142,11 @@ async function listIssueBlockerAttentionMap(
         });
         nextFrontier.add(row.blockerIssueId);
       }
+      if (truncated) break;
     }
 
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) {
-      truncated = true;
-      break;
-    }
     frontier = [...nextFrontier];
   }
-  if (frontier.length > 0) truncated = true;
 
   const nodeIds = [...nodesById.keys()];
   const activeIssueIds = new Set<string>();

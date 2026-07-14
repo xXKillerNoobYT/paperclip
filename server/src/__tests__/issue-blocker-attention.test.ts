@@ -325,6 +325,106 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("classifies a blocker chain beyond depth eight identically for single and bulk reads", async () => {
+    const { companyId } = await createCompany("PBDP");
+    const chainIds: string[] = [];
+    for (let index = 0; index < 12; index += 1) {
+      chainIds.push(await insertIssue({
+        companyId,
+        identifier: `PBDP-${index + 1}`,
+        title: index === 11 ? "Terminal human review" : `Blocked chain ${index + 1}`,
+        status: index === 11 ? "in_review" : "blocked",
+        assigneeUserId: index === 11 ? "board-reviewer" : null,
+      }));
+    }
+    for (let index = 0; index < chainIds.length - 1; index += 1) {
+      await block({
+        companyId,
+        blockerIssueId: chainIds[index + 1]!,
+        blockedIssueId: chainIds[index]!,
+      });
+    }
+
+    const root = await svc.getById(chainIds[0]!);
+    expect(root).not.toBeNull();
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(chainIds[0]!);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked" }))
+      .find((issue) => issue.id === chainIds[0]);
+    const relations = await svc.getRelationSummaries(chainIds[0]!);
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBDP-12",
+    });
+    expect(relations.blockedBy).toHaveLength(1);
+    expect(relations.blockedBy[0]?.terminalBlockers).toEqual([
+      expect.objectContaining({ id: chainIds[11], identifier: "PBDP-12" }),
+    ]);
+  });
+
+  it("fails closed for an explicit blocker cycle", async () => {
+    const { companyId } = await createCompany("PBCY");
+    const rootId = await insertIssue({ companyId, identifier: "PBCY-1", title: "Cycle root", status: "blocked" });
+    const middleId = await insertIssue({ companyId, identifier: "PBCY-2", title: "Cycle middle", status: "blocked" });
+    const tailId = await insertIssue({ companyId, identifier: "PBCY-3", title: "Cycle tail", status: "blocked" });
+    await block({ companyId, blockerIssueId: middleId, blockedIssueId: rootId });
+    await block({ companyId, blockerIssueId: tailId, blockedIssueId: middleId });
+    // Insert directly to exercise defensive read behavior for legacy/corrupt graphs;
+    // normal service writes reject this closing edge.
+    await block({ companyId, blockerIssueId: rootId, blockedIssueId: tailId });
+
+    const root = await svc.getById(rootId);
+    const attention = (await svc.listBlockerAttention(companyId, [root!])).get(rootId);
+    const relations = await svc.getRelationSummaries(rootId);
+
+    expect(attention).toMatchObject({
+      state: "needs_attention",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
+    expect(relations.blockedBy[0]?.terminalBlockers).toBeUndefined();
+  });
+
+  it("fails closed when blocker graph expansion exceeds the node budget", async () => {
+    const { companyId } = await createCompany("PBBG");
+    const rootId = await insertIssue({ companyId, identifier: "PBBG-1", title: "Budget root", status: "blocked" });
+    const blockerRows = Array.from({ length: 2001 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBBG-${index + 2}`,
+      title: `Covered blocker ${index + 1}`,
+      status: "blocked",
+      priority: "medium" as const,
+      assigneeUserId: "board-reviewer",
+      originKind: "manual",
+      originFingerprint: `budget-${index}`,
+    }));
+    await db.insert(issues).values(blockerRows);
+    await db.insert(issueRelations).values(blockerRows.map((row) => ({
+      companyId,
+      issueId: row.id,
+      relatedIssueId: rootId,
+      type: "blocks" as const,
+    })));
+
+    const root = await svc.getById(rootId);
+    const attention = (await svc.listBlockerAttention(companyId, [root!])).get(rootId);
+    const relations = await svc.getRelationSummaries(rootId);
+
+    expect(attention).toMatchObject({
+      state: "needs_attention",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 2001,
+    });
+    expect(relations.blockedBy).toHaveLength(2001);
+    expect(relations.blockedBy.every((blocker) => blocker.terminalBlockers === undefined)).toBe(true);
+  }, 20_000);
+
   it("does not let another company's active run cover the blocker", async () => {
     const { companyId, agentId } = await createCompany("PBS");
     const other = await createCompany("PBT");
