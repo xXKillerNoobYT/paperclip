@@ -183,6 +183,30 @@ Database backups do not include non-database instance files such as local-disk
 uploads, workspace files, or the local encrypted secrets master key. Back those paths
 up separately when you need full instance disaster recovery.
 
+Backup publication is atomic. Paperclip writes run-owned `.partial-<run>` files,
+validates the completed gzip stream, and publishes it as `.sql.gz` only after the
+integrity check passes. A failed run retains its own intermediate for diagnosis;
+the server error log includes `retainedIntermediateFiles`, and `/api/health`
+reports `database_backup_incomplete` while those files remain. Manual backups use
+`paperclip-manual-<timestamp>-<id>.sql.gz` and are excluded from automatic retention.
+
+Automatic retention validates gzip integrity before an archive is eligible for
+deletion, keeps at least 24 valid automatic backups, preserves manual/legacy and
+invalid archives, and never deletes the last valid automatic backup. Integrity
+results are cached by filename, size, and modification time in
+`data/backups/.paperclip-backup-integrity-failures.json`; the marker is updated
+atomically on each backup run. Invalid archives remain available for forensics,
+produce an `invalid_archive_retained` warning in the server log, and appear as
+`database_backup_invalid_archive` in `/api/health`.
+
+Operations should review backup warnings daily and after any failed scheduled run.
+Open a critical data-durability issue immediately when health reports an invalid
+archive, a retained intermediate, no backup, or a stale backup. Retry only after
+recording the retained paths; do not delete evidence until a known-good restore set
+and rollback window have been confirmed. Rollback for this behavior is a code
+revert: the archive format and restore input contract are unchanged, and no
+existing backup migration is required.
+
 ## Secret storage
 
 Paperclip stores secret metadata and versions in:

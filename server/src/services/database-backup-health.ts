@@ -1,8 +1,11 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { BACKUP_INTEGRITY_FAILURE_MARKER } from "@paperclipai/db";
 
 export type DatabaseBackupHealthWarningCode =
   | "database_backup_check_failed"
+  | "database_backup_incomplete"
+  | "database_backup_invalid_archive"
   | "database_backup_last_failure"
   | "database_backup_missing"
   | "database_backup_stale";
@@ -29,6 +32,8 @@ export type DatabaseBackupHealthStatus = {
     mtime: string;
     message: string;
   } | null;
+  retainedIntermediateFiles: string[];
+  invalidBackupFiles: string[];
   warnings: DatabaseBackupHealthWarning[];
 };
 
@@ -102,6 +107,30 @@ function findLatestBackup(backupDir: string, nowMs: number) {
   };
 }
 
+function findRetainedIntermediateFiles(backupDir: string): string[] {
+  if (!existsSync(backupDir)) return [];
+  return readdirSync(backupDir)
+    .filter((name) => name.includes(".sql.gz.partial-"))
+    .map((name) => resolve(backupDir, name))
+    .sort();
+}
+
+function readInvalidBackupFiles(backupDir: string): string[] {
+  const markerFile = resolve(backupDir, BACKUP_INTEGRITY_FAILURE_MARKER);
+  if (!existsSync(markerFile)) return [];
+  const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { invalidBackupFiles?: unknown };
+  if (!Array.isArray(parsed.invalidBackupFiles)) return [];
+  const resolvedBackupDir = resolve(backupDir);
+  return parsed.invalidBackupFiles
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => resolve(value))
+    .filter((value) => {
+      const relativePath = relative(resolvedBackupDir, value);
+      return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath) && existsSync(value);
+    })
+    .sort();
+}
+
 export function inspectDatabaseBackupHealth(
   opts: InspectDatabaseBackupHealthOptions,
 ): DatabaseBackupHealthStatus {
@@ -111,10 +140,14 @@ export function inspectDatabaseBackupHealth(
 
   let latestBackup: DatabaseBackupHealthStatus["latestBackup"] = null;
   let lastFailure: DatabaseBackupHealthStatus["lastFailure"] = null;
+  let retainedIntermediateFiles: string[] = [];
+  let invalidBackupFiles: string[] = [];
 
   try {
     latestBackup = findLatestBackup(opts.backupDir, now.getTime());
     lastFailure = readLastFailure(alertFileCandidates(opts));
+    retainedIntermediateFiles = findRetainedIntermediateFiles(opts.backupDir);
+    invalidBackupFiles = readInvalidBackupFiles(opts.backupDir);
 
     if (!latestBackup) {
       warnings.push({
@@ -134,6 +167,18 @@ export function inspectDatabaseBackupHealth(
         message: lastFailure.message,
       });
     }
+    if (retainedIntermediateFiles.length > 0) {
+      warnings.push({
+        code: "database_backup_incomplete",
+        message: `Retained incomplete database backup intermediate(s): ${retainedIntermediateFiles.join(", ")}`,
+      });
+    }
+    if (invalidBackupFiles.length > 0) {
+      warnings.push({
+        code: "database_backup_invalid_archive",
+        message: `Integrity-invalid database backup archive(s) retained: ${invalidBackupFiles.join(", ")}`,
+      });
+    }
   } catch (error) {
     warnings.push({
       code: "database_backup_check_failed",
@@ -148,6 +193,8 @@ export function inspectDatabaseBackupHealth(
     maxAgeHours,
     latestBackup,
     lastFailure,
+    retainedIntermediateFiles,
+    invalidBackupFiles,
     warnings,
   };
 }

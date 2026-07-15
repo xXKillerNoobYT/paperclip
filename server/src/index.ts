@@ -23,6 +23,7 @@ import {
   prepareEmbeddedPostgresNativeRuntime,
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
+  getDatabaseBackupRetainedArtifacts,
   runDatabaseBackup,
   authUsers,
   companies,
@@ -632,6 +633,13 @@ export async function startServer(): Promise<StartedServer> {
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        backupKind: trigger === "scheduled" ? "automatic" : "manual",
+        onDiagnostic: (diagnostic) => {
+          logger.warn(
+            { ...diagnostic, trigger },
+            "Database backup completed with a maintenance warning",
+          );
+        },
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -657,7 +665,15 @@ export async function startServer(): Promise<StartedServer> {
       );
       return response;
     } catch (err) {
-      logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
+      logger.error(
+        {
+          err,
+          backupDir: config.databaseBackupDir,
+          trigger,
+          retainedIntermediateFiles: getDatabaseBackupRetainedArtifacts(err),
+        },
+        `${label} database backup failed`,
+      );
       throw err;
     } finally {
       databaseBackupInFlight = false;

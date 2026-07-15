@@ -1,8 +1,21 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
+import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -28,7 +41,21 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  backupKind?: "automatic" | "manual";
+  onDiagnostic?: (diagnostic: DatabaseBackupDiagnostic) => void;
 };
+
+export type DatabaseBackupDiagnostic =
+  | {
+    code: "invalid_archive_retained";
+    backupFile: string;
+  }
+  | {
+    code: "cleanup_failed" | "retention_failed";
+    backupFile: string;
+    message: string;
+    retainedArtifacts?: string[];
+  };
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
@@ -70,6 +97,8 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+const MINIMUM_VALID_AUTOMATIC_BACKUPS = 24;
+export const BACKUP_INTEGRITY_FAILURE_MARKER = ".paperclip-backup-integrity-failures.json";
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -107,17 +136,112 @@ function monthKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
 }
 
-/**
- * Tiered backup pruning:
- * - Daily tier: keep ALL backups from the last `dailyDays` days
- * - Weekly tier: keep the NEWEST backup per calendar week for `weeklyWeeks` weeks
- * - Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
- * - Everything else is deleted
- */
-function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
-  if (!existsSync(backupDir)) return 0;
+export class DatabaseBackupError extends Error {
+  readonly retainedArtifacts: string[];
 
-  const now = Date.now();
+  constructor(message: string, retainedArtifacts: string[], cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "DatabaseBackupError";
+    this.retainedArtifacts = retainedArtifacts;
+  }
+}
+
+export function getDatabaseBackupRetainedArtifacts(error: unknown): string[] {
+  return error instanceof DatabaseBackupError ? error.retainedArtifacts : [];
+}
+
+export async function verifyGzipFile(filePath: string): Promise<void> {
+  await pipeline(
+    createReadStream(filePath),
+    createGunzip(),
+    new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    }),
+  );
+}
+
+export async function publishVerifiedGzip(intermediateFile: string, backupFile: string): Promise<void> {
+  try {
+    await verifyGzipFile(intermediateFile);
+    if (existsSync(backupFile)) {
+      throw new Error(`Refusing to replace existing backup archive: ${backupFile}`);
+    }
+    renameSync(intermediateFile, backupFile);
+  } catch (error) {
+    throw new DatabaseBackupError(
+      `Backup archive validation or publication failed; retained intermediate: ${intermediateFile}`,
+      existsSync(intermediateFile) ? [intermediateFile] : [],
+      error,
+    );
+  }
+}
+
+function automaticBackupPattern(filenamePrefix: string): RegExp {
+  const escapedPrefix = filenamePrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escapedPrefix}-\\d{8}-\\d{6}(?:-[0-9a-f-]{36})?\\.sql\\.gz$`);
+}
+
+type BackupIntegrityCacheEntry = {
+  name: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  valid: boolean;
+};
+
+function readIntegrityCache(backupDir: string): Map<string, BackupIntegrityCacheEntry> {
+  const markerFile = resolve(backupDir, BACKUP_INTEGRITY_FAILURE_MARKER);
+  if (!existsSync(markerFile)) return new Map();
+  try {
+    const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { checkedArchives?: unknown };
+    if (!Array.isArray(parsed.checkedArchives)) return new Map();
+    return new Map(parsed.checkedArchives.flatMap((value) => {
+      if (!value || typeof value !== "object") return [];
+      const entry = value as Partial<BackupIntegrityCacheEntry>;
+      if (
+        typeof entry.name !== "string" ||
+        typeof entry.sizeBytes !== "number" ||
+        typeof entry.mtimeMs !== "number" ||
+        typeof entry.valid !== "boolean"
+      ) return [];
+      return [[entry.name, entry as BackupIntegrityCacheEntry]];
+    }));
+  } catch {
+    return new Map();
+  }
+}
+
+function writeIntegrityFailureMarker(
+  backupDir: string,
+  invalidBackupFiles: string[],
+  checkedArchives: BackupIntegrityCacheEntry[],
+  checkedAt: Date,
+): void {
+  const markerFile = resolve(backupDir, BACKUP_INTEGRITY_FAILURE_MARKER);
+  const intermediateFile = `${markerFile}.partial-${process.pid}-${randomUUID()}`;
+  writeFileSync(intermediateFile, `${JSON.stringify({
+    checkedAt: checkedAt.toISOString(),
+    invalidBackupFiles,
+    checkedArchives,
+  }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  renameSync(intermediateFile, markerFile);
+}
+
+/**
+ * Tiered backup pruning for integrity-valid automatic archives only. Manual,
+ * legacy, invalid, and run-owned intermediate files are never retention
+ * candidates. At least 24 valid automatic archives are always retained.
+ */
+export async function pruneOldBackups(
+  backupDir: string,
+  retention: BackupRetentionPolicy,
+  filenamePrefix: string,
+  nowDate: Date = new Date(),
+): Promise<{ prunedCount: number; invalidBackupFiles: string[] }> {
+  if (!existsSync(backupDir)) return { prunedCount: 0, invalidBackupFiles: [] };
+
+  const now = nowDate.getTime();
   const dailyCutoff = now - Math.max(1, retention.dailyDays) * 24 * 60 * 60 * 1000;
   const weeklyCutoff = now - Math.max(1, retention.weeklyWeeks) * 7 * 24 * 60 * 60 * 1000;
   const monthlyCutoff = now - Math.max(1, retention.monthlyMonths) * 30 * 24 * 60 * 60 * 1000;
@@ -125,13 +249,36 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   type BackupEntry = { name: string; fullPath: string; mtimeMs: number };
   const entries: BackupEntry[] = [];
 
+  const invalidBackupFiles: string[] = [];
+  const checkedArchives: BackupIntegrityCacheEntry[] = [];
+  const integrityCache = readIntegrityCache(backupDir);
+  const automaticPattern = automaticBackupPattern(filenamePrefix);
   for (const name of readdirSync(backupDir)) {
-    if (!name.startsWith(`${filenamePrefix}-`)) continue;
-    if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
+    if (!automaticPattern.test(name)) continue;
     const fullPath = resolve(backupDir, name);
     const stat = statSync(fullPath);
+    if (!stat.isFile()) continue;
+    const cached = integrityCache.get(name);
+    let valid = cached?.sizeBytes === stat.size && cached.mtimeMs === stat.mtimeMs
+      ? cached.valid
+      : false;
+    if (!cached || cached.sizeBytes !== stat.size || cached.mtimeMs !== stat.mtimeMs) {
+      try {
+        await verifyGzipFile(fullPath);
+        valid = true;
+      } catch {
+        valid = false;
+      }
+    }
+    checkedArchives.push({ name, sizeBytes: stat.size, mtimeMs: stat.mtimeMs, valid });
+    if (!valid) {
+      invalidBackupFiles.push(fullPath);
+      continue;
+    }
     entries.push({ name, fullPath, mtimeMs: stat.mtimeMs });
   }
+
+  writeIntegrityFailureMarker(backupDir, invalidBackupFiles, checkedArchives, nowDate);
 
   // Sort newest first so the first entry per week/month bucket is the one we keep
   entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
@@ -172,11 +319,16 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
     toDelete.push(entry.fullPath);
   }
 
-  for (const filePath of toDelete) {
+  const deletionLimit = Math.max(0, entries.length - MINIMUM_VALID_AUTOMATIC_BACKUPS);
+  const filesToDelete = toDelete
+    .sort((left, right) => statSync(left).mtimeMs - statSync(right).mtimeMs)
+    .slice(0, deletionLimit);
+
+  for (const filePath of filesToDelete) {
     unlinkSync(filePath);
   }
 
-  return toDelete.length;
+  return { prunedCount: filesToDelete.length, invalidBackupFiles };
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -500,14 +652,14 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       const file = await filePromise;
       await file.close();
     },
-    async abort() {
+    async abort(removeFile = true) {
       if (closed) return;
       closed = true;
       bufferedLines = [];
       bufferedBytes = 0;
       await pendingWrite.catch(() => {});
       await filePromise.then((file) => file.close()).catch(() => {});
-      if (existsSync(filePath)) {
+      if (removeFile && existsSync(filePath)) {
         try {
           unlinkSync(filePath);
         } catch {
@@ -520,6 +672,7 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
 
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
+  const backupKind = opts.backupKind ?? "automatic";
   const retention = opts.retention;
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
   const backupEngine = opts.backupEngine ?? "auto";
@@ -534,9 +687,54 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-  const backupFile = `${sqlFile}.gz`;
+  const backupStem = `${filenamePrefix}-${backupKind === "manual" ? "manual-" : ""}${timestamp()}`;
+  const backupId = randomUUID();
+  const backupFile = resolve(opts.backupDir, `${backupStem}-${backupId}.sql.gz`);
+  const runSuffix = `${process.pid}-${backupId}`;
+  const sqlFile = `${backupFile}.partial-${runSuffix}.sql`;
+  let compressedFile = `${backupFile}.partial-${runSuffix}`;
+  const failedEngineArtifacts: string[] = [];
   const writer = createBufferedTextFileWriter(sqlFile);
+
+  const emitDiagnostic = (diagnostic: DatabaseBackupDiagnostic): void => {
+    try {
+      const observer = opts.onDiagnostic;
+      observer?.(diagnostic);
+    } catch {
+      // Observability hooks must never change backup durability semantics.
+    }
+  };
+
+  const finishRetention = async (): Promise<number> => {
+    try {
+      const retentionResult = await pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+      for (const invalidBackupFile of retentionResult.invalidBackupFiles) {
+        emitDiagnostic({ code: "invalid_archive_retained", backupFile: invalidBackupFile });
+      }
+      return retentionResult.prunedCount;
+    } catch (error) {
+      emitDiagnostic({
+        code: "retention_failed",
+        backupFile,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
+    }
+  };
+
+  const cleanupPublishedIntermediate = (filePath: string): void => {
+    if (!existsSync(filePath)) return;
+    try {
+      unlinkSync(filePath);
+    } catch (error) {
+      emitDiagnostic({
+        code: "cleanup_failed",
+        backupFile,
+        message: error instanceof Error ? error.message : String(error),
+        retainedArtifacts: [filePath],
+      });
+    }
+  };
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
@@ -545,24 +743,34 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: compressedFile,
           connectTimeout,
         });
+        await publishVerifiedGzip(compressedFile, backupFile);
         await writer.abort();
+        if (existsSync(sqlFile)) {
+          emitDiagnostic({
+            code: "cleanup_failed",
+            backupFile,
+            message: "Failed to remove the run-owned SQL intermediate after publication",
+            retainedArtifacts: [sqlFile],
+          });
+        }
         const sizeBytes = statSync(backupFile).size;
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+        const prunedCount = await finishRetention();
         return {
           backupFile,
           sizeBytes,
           prunedCount,
         };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
         if (backupEngine === "pg_dump") {
           throw error;
         }
+        if (existsSync(compressedFile)) {
+          failedEngineArtifacts.push(compressedFile);
+        }
+        compressedFile = `${backupFile}.partial-${runSuffix}-javascript`;
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
         sqlClosed = false;
       }
@@ -957,12 +1165,16 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     // Compress the SQL file with gzip
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    const gzWriteStream = createWriteStream(compressedFile);
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    unlinkSync(sqlFile);
+    await publishVerifiedGzip(compressedFile, backupFile);
+    cleanupPublishedIntermediate(sqlFile);
+    for (const failedArtifact of failedEngineArtifacts) {
+      cleanupPublishedIntermediate(failedArtifact);
+    }
 
     const sizeBytes = statSync(backupFile).size;
-    const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+    const prunedCount = await finishRetention();
 
     return {
       backupFile,
@@ -970,14 +1182,20 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       prunedCount,
     };
   } catch (error) {
-    await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
+    await writer.abort(false);
+    const retainedArtifacts = [sqlFile, compressedFile, ...failedEngineArtifacts]
+      .filter((filePath) => existsSync(filePath));
+    if (error instanceof DatabaseBackupError) {
+      const combinedArtifacts = [...new Set([...error.retainedArtifacts, ...retainedArtifacts])];
+      throw new DatabaseBackupError(error.message, combinedArtifacts, error);
     }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
-    }
-    throw error;
+    throw new DatabaseBackupError(
+      retainedArtifacts.length > 0
+        ? `Database backup failed; retained intermediate(s): ${retainedArtifacts.join(", ")}`
+        : "Database backup failed before an intermediate could be retained",
+      retainedArtifacts,
+      error,
+    );
   } finally {
     await closeSql();
   }

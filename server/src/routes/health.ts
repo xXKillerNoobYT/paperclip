@@ -38,6 +38,8 @@ function hasDevServerStatusToken(providedToken: string | undefined) {
 function redactedDatabaseBackupWarning(warning: DatabaseBackupHealthWarning): DatabaseBackupHealthWarning {
   const messages: Record<DatabaseBackupHealthWarning["code"], string> = {
     database_backup_check_failed: "Database backup health check failed.",
+    database_backup_incomplete: "Incomplete database backup intermediates are retained.",
+    database_backup_invalid_archive: "Integrity-invalid database backup archives are retained.",
     database_backup_last_failure: "Database backup failure marker is present.",
     database_backup_missing: "No recent database backup was found.",
     database_backup_stale: "Latest database backup is stale.",

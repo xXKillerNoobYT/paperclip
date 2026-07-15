@@ -75,6 +75,8 @@ export async function dbBackupCommand(opts: DbBackupOptions): Promise<void> {
       backupDir,
       retention: { dailyDays: retentionDays, weeklyWeeks: 4, monthlyMonths: 1 },
       filenamePrefix,
+      backupKind: "manual",
+      onDiagnostic: (diagnostic) => console.warn("Backup maintenance warning:", diagnostic),
     });
     spinner.stop(`Backup saved: ${formatDatabaseBackupResult(result)}`);
 

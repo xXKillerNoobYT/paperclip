@@ -1017,9 +1017,13 @@ registry.registerPath({
           mtime: z.string().datetime(),
           message: z.string(),
         }).nullable().optional(),
+        retainedIntermediateFiles: z.array(z.string()).optional(),
+        invalidBackupFiles: z.array(z.string()).optional(),
         warnings: z.array(z.object({
           code: z.enum([
             "database_backup_check_failed",
+            "database_backup_incomplete",
+            "database_backup_invalid_archive",
             "database_backup_last_failure",
             "database_backup_missing",
             "database_backup_stale",
