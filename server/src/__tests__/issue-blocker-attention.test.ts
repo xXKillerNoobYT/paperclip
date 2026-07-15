@@ -410,6 +410,72 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     ]);
   }, 20_000);
 
+  it("keeps exact-depth classification shape-independent with a wide intermediate frontier", async () => {
+    const { companyId } = await createCompany("PBMW");
+    const chainRows = Array.from({ length: 513 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBMW-${index + 1}`,
+      title: index === 512 ? "Terminal human review" : `Blocked chain ${index + 1}`,
+      status: index === 512 ? "in_review" as const : "blocked" as const,
+      priority: "medium" as const,
+      assigneeUserId: index === 512 ? "board-reviewer" : null,
+      originKind: "manual",
+      originFingerprint: `mixed-chain-${index}`,
+    }));
+    const wideRows = Array.from({ length: 500 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBMW-W${index + 1}`,
+      title: `Covered terminal ${index + 1}`,
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeUserId: "board-reviewer",
+      originKind: "manual",
+      originFingerprint: `mixed-wide-${index}`,
+    }));
+    for (const rows of [chainRows, wideRows]) {
+      for (let index = 0; index < rows.length; index += 500) {
+        await db.insert(issues).values(rows.slice(index, index + 500));
+      }
+    }
+    await db.insert(issueRelations).values([
+      ...chainRows.slice(1).map((row, index) => ({
+        companyId,
+        issueId: row.id,
+        relatedIssueId: chainRows[index]!.id,
+        type: "blocks" as const,
+      })),
+      ...wideRows.map((row) => ({
+        companyId,
+        issueId: row.id,
+        relatedIssueId: chainRows[1]!.id,
+        type: "blocks" as const,
+      })),
+    ]);
+
+    const root = await svc.getById(chainRows[0]!.id);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(chainRows[0]!.id);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked" }))
+      .find((issue) => issue.id === chainRows[0]!.id);
+    const relations = await svc.getRelationSummaries(chainRows[0]!.id);
+    const terminalBlockers = relations.blockedBy[0]?.terminalBlockers;
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+    });
+    expect(terminalBlockers).toHaveLength(501);
+    expect(terminalBlockers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: chainRows[512]!.id, identifier: "PBMW-513" }),
+      ...wideRows.map((row) => expect.objectContaining({ id: row.id, identifier: row.identifier })),
+    ]));
+  }, 30_000);
+
   it("fails closed per root when a chain exceeds the traversal depth budget", async () => {
     const { companyId } = await createCompany("PBRB");
     const chainRows = Array.from({ length: 514 }, (_, index) => ({

@@ -1634,10 +1634,13 @@ const BLOCKER_ATTENTION_MAX_NODES = 2000;
 // enforce this same path limit per root so response shape cannot bypass it.
 const BLOCKER_ATTENTION_MAX_PATH_DEPTH = 512;
 // One batch issues at most two parallel statements (explicit blockers + children).
-// A path at the exact depth ceiling needs one final sentinel query to prove that
-// its last node is terminal. Keep that bounded lookahead separate from the path
-// limit so individual reads and bulk-preseeded reads agree at the boundary.
-const BLOCKER_ATTENTION_MAX_QUERY_BATCHES = BLOCKER_ATTENTION_MAX_PATH_DEPTH + 1;
+// A path at the exact depth ceiling needs one batch per level plus terminal
+// lookahead. Wide intermediate frontiers can add chunk batches without adding
+// path depth; their maximum extra work is bounded by the node ceiling. Derive a
+// global ceiling that admits every graph already allowed by the node/path limits,
+// independent of whether bulk reads pre-seed intermediate roots.
+const BLOCKER_ATTENTION_MAX_QUERY_BATCHES = BLOCKER_ATTENTION_MAX_PATH_DEPTH
+  + Math.ceil(BLOCKER_ATTENTION_MAX_NODES / ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE);
 // Nodes alone do not bound a dense graph. Every query is also limited to the
 // remaining unique-edge allowance plus one sentinel row.
 const BLOCKER_ATTENTION_MAX_EDGES = 4000;
