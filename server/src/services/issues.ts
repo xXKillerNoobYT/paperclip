@@ -1628,8 +1628,22 @@ function lowTrustBoundaryIssueCondition(
 }
 
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
-const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
+// The shared traversal may discover a graph faster when a bulk response seeds
+// intermediate blocked roots. Classification and terminal expansion therefore
+// enforce this same path limit per root so response shape cannot bypass it.
+const BLOCKER_ATTENTION_MAX_PATH_DEPTH = 512;
+// One batch issues at most two parallel statements (explicit blockers + children).
+// A path at the exact depth ceiling needs one batch per level plus terminal
+// lookahead. Wide intermediate frontiers can add chunk batches without adding
+// path depth; their maximum extra work is bounded by the node ceiling. Derive a
+// global ceiling that admits every graph already allowed by the node/path limits,
+// independent of whether bulk reads pre-seed intermediate roots.
+const BLOCKER_ATTENTION_MAX_QUERY_BATCHES = BLOCKER_ATTENTION_MAX_PATH_DEPTH
+  + Math.ceil(BLOCKER_ATTENTION_MAX_NODES / ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE);
+// Nodes alone do not bound a dense graph. Every query is also limited to the
+// remaining unique-edge allowance plus one sentinel row.
+const BLOCKER_ATTENTION_MAX_EDGES = 4000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
 
 type IssueBlockerAttentionNode = {
@@ -1804,19 +1818,6 @@ function blockerSampleIdentifier(node: IssueBlockerAttentionNode | null | undefi
   return node?.identifier ?? node?.id ?? null;
 }
 
-function appendBlockerAttentionEdges(
-  edgesByIssueId: Map<string, IssueBlockerAttentionEdge[]>,
-  rows: IssueBlockerAttentionEdge[],
-) {
-  for (const row of rows) {
-    const existing = edgesByIssueId.get(row.issueId) ?? [];
-    if (!existing.some((edge) => edge.blockerIssueId === row.blockerIssueId)) {
-      existing.push(row);
-      edgesByIssueId.set(row.issueId, existing);
-    }
-  }
-}
-
 type IssueRelationSummaryRow = {
   relatedId: string;
   identifier: string | null;
@@ -1841,6 +1842,7 @@ function summarizeIssueRelationRow(row: IssueRelationSummaryRow): IssueRelationI
 
 async function terminalExplicitBlockersByRoot(
   companyId: string,
+  sourceIssueIds: string[],
   roots: IssueRelationIssueSummary[],
   dbOrTx: DbReader,
 ): Promise<Map<string, IssueRelationIssueSummary[]>> {
@@ -1853,9 +1855,23 @@ async function terminalExplicitBlockersByRoot(
   for (const root of roots) nodesById.set(root.id, root);
 
   let frontier = rootIds;
-  for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
+  // Count the original issues and every blocker reached from them exactly once.
+  // Direct blockers can also be source roots in bulk reads, so nodesById alone
+  // would make the budget depend on which response shape requested the graph.
+  const budgetNodeIds = new Set(sourceIssueIds);
+  for (const rootId of rootIds) budgetNodeIds.add(rootId);
+  let truncated = budgetNodeIds.size > BLOCKER_ATTENTION_MAX_NODES;
+  let queryBatchCount = 0;
+  let edgeCount = 0;
+  while (frontier.length > 0 && !truncated) {
     const nextFrontier = new Set<string>();
     for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+      if (queryBatchCount >= BLOCKER_ATTENTION_MAX_QUERY_BATCHES || edgeCount >= BLOCKER_ATTENTION_MAX_EDGES) {
+        truncated = true;
+        break;
+      }
+      queryBatchCount += 1;
+      const rowLimit = BLOCKER_ATTENTION_MAX_EDGES - edgeCount + 1;
       const rows = await dbOrTx
         .select({
           currentIssueId: issueRelations.relatedIssueId,
@@ -1877,42 +1893,104 @@ async function terminalExplicitBlockersByRoot(
             eq(issues.companyId, companyId),
             ne(issues.status, "done"),
           ),
-        );
+        )
+        .orderBy(asc(issueRelations.relatedIssueId), asc(issues.id))
+        .limit(rowLimit);
+
+      if (rows.length >= rowLimit) truncated = true;
 
       for (const row of rows) {
         const existingEdges = edgesByIssueId.get(row.currentIssueId) ?? [];
         if (!existingEdges.includes(row.relatedId)) {
+          if (edgeCount >= BLOCKER_ATTENTION_MAX_EDGES) {
+            truncated = true;
+            continue;
+          }
           existingEdges.push(row.relatedId);
           edgesByIssueId.set(row.currentIssueId, existingEdges);
+          edgeCount += 1;
+        }
+        if (!budgetNodeIds.has(row.relatedId)) {
+          if (budgetNodeIds.size >= BLOCKER_ATTENTION_MAX_NODES) {
+            truncated = true;
+            continue;
+          }
+          budgetNodeIds.add(row.relatedId);
         }
         if (!nodesById.has(row.relatedId)) {
           nodesById.set(row.relatedId, summarizeIssueRelationRow(row));
           nextFrontier.add(row.relatedId);
         }
       }
+      if (truncated) break;
     }
 
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) break;
     frontier = [...nextFrontier];
   }
 
-  const collectTerminal = (issueId: string, seen: Set<string>): IssueRelationIssueSummary[] => {
-    if (seen.has(issueId)) return [];
-    const node = nodesById.get(issueId);
-    if (!node || node.status === "done") return [];
-    const nextSeen = new Set(seen);
-    nextSeen.add(issueId);
-    const downstreamIds = edgesByIssueId.get(issueId) ?? [];
-    if (downstreamIds.length === 0) return [node];
-    return downstreamIds.flatMap((downstreamId) => collectTerminal(downstreamId, nextSeen));
-  };
+  // A partial graph cannot identify a true terminal blocker. Omitting nested
+  // terminal expansion is safer than presenting the budget boundary as a leaf.
+  if (truncated) return terminalByRoot;
 
   for (const rootId of rootIds) {
     const deduped = new Map<string, IssueRelationIssueSummary>();
-    for (const blocker of collectTerminal(rootId, new Set())) {
-      if (blocker.id !== rootId) deduped.set(blocker.id, blocker);
+    const reachable = new Set<string>([rootId]);
+    const discovery = [rootId];
+    while (discovery.length > 0) {
+      const issueId = discovery.pop()!;
+      const node = nodesById.get(issueId);
+      if (!node || node.status === "done") continue;
+      for (const downstreamId of edgesByIssueId.get(issueId) ?? []) {
+        if (reachable.has(downstreamId)) continue;
+        reachable.add(downstreamId);
+        discovery.push(downstreamId);
+      }
     }
-    if (deduped.size > 0) {
+
+    const indegreeById = new Map([...reachable].map((issueId) => [issueId, 0]));
+    for (const issueId of reachable) {
+      for (const downstreamId of edgesByIssueId.get(issueId) ?? []) {
+        if (!reachable.has(downstreamId)) continue;
+        indegreeById.set(downstreamId, (indegreeById.get(downstreamId) ?? 0) + 1);
+      }
+    }
+
+    const pending = [...indegreeById]
+      .filter(([, indegree]) => indegree === 0)
+      .map(([issueId]) => issueId);
+    const maxDepthById = new Map<string, number>([[rootId, 1]]);
+    let processedCount = 0;
+    let rootTruncated = false;
+    while (pending.length > 0) {
+      const issueId = pending.pop()!;
+      processedCount += 1;
+      const depth = maxDepthById.get(issueId) ?? 1;
+      if (depth > BLOCKER_ATTENTION_MAX_PATH_DEPTH) {
+        rootTruncated = true;
+        break;
+      }
+      const node = nodesById.get(issueId);
+      if (!node || node.status === "done") continue;
+      const downstreamIds = edgesByIssueId.get(issueId) ?? [];
+      if (downstreamIds.length === 0) {
+        if (node.id !== rootId) deduped.set(node.id, node);
+        continue;
+      }
+      for (const downstreamId of downstreamIds) {
+        if (!reachable.has(downstreamId)) continue;
+        maxDepthById.set(
+          downstreamId,
+          Math.max(maxDepthById.get(downstreamId) ?? 1, depth + 1),
+        );
+        const remainingIndegree = (indegreeById.get(downstreamId) ?? 1) - 1;
+        indegreeById.set(downstreamId, remainingIndegree);
+        if (remainingIndegree === 0) pending.push(downstreamId);
+      }
+    }
+    // A cycle leaves at least one reachable node outside the topological order.
+    // Treat it as unknown rather than publishing a partial set of terminals.
+    if (processedCount < reachable.size) rootTruncated = true;
+    if (!rootTruncated && deduped.size > 0) {
       terminalByRoot.set(rootId, [...deduped.values()].sort((a, b) => a.title.localeCompare(b.title)));
     }
   }
@@ -2049,11 +2127,107 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) nodesById.set(root.id, { ...root });
 
   let frontier = roots.map((root) => root.id);
-  let truncated = false;
-  for (let depth = 0; frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH; depth += 1) {
+  const rootIdsByNodeId = new Map<string, Set<string>>();
+  const nodeIdsByRootId = new Map<string, Set<string>>();
+  const edgeKeysByRootId = new Map<string, Set<string>>();
+  const queryBatchCountByRootId = new Map<string, number>();
+  const incompleteNodeIdsByRootId = new Map<string, Set<string>>();
+  const incompleteNodeIds = new Set<string>();
+  const truncatedRootIds = new Set<string>();
+  const queriedNodeIds = new Set<string>();
+  for (const root of roots) {
+    rootIdsByNodeId.set(root.id, new Set([root.id]));
+    nodeIdsByRootId.set(root.id, new Set([root.id]));
+    edgeKeysByRootId.set(root.id, new Set());
+    queryBatchCountByRootId.set(root.id, 0);
+    incompleteNodeIdsByRootId.set(root.id, new Set());
+  }
+  const sharedNodeDiscoveryLimit = (BLOCKER_ATTENTION_MAX_NODES + 1) * roots.length;
+  const sharedEdgeDiscoveryLimit = (BLOCKER_ATTENTION_MAX_EDGES + 1) * roots.length;
+  const sharedQueryBatchLimit = BLOCKER_ATTENTION_MAX_QUERY_BATCHES * roots.length;
+  let sharedBudgetExhausted = nodesById.size > sharedNodeDiscoveryLimit;
+  let sharedQueryBatchCount = 0;
+  let sharedEdgeCount = 0;
+  const markRootIncomplete = (rootId: string, issueId: string) => {
+    truncatedRootIds.add(rootId);
+    incompleteNodeIdsByRootId.get(rootId)?.add(issueId);
+  };
+  const markNodeIncomplete = (issueId: string) => {
+    incompleteNodeIds.add(issueId);
+    for (const rootId of rootIdsByNodeId.get(issueId) ?? []) {
+      markRootIncomplete(rootId, issueId);
+    }
+  };
+  const frontierChunksByRootProvenance = (issueIds: string[]) => {
+    const groups = new Map<string, string[]>();
+    for (const issueId of [...new Set(issueIds)]) {
+      const rootIds = [...(rootIdsByNodeId.get(issueId) ?? [])]
+        .filter((rootId) => !truncatedRootIds.has(rootId))
+        .sort();
+      if (rootIds.length === 0) continue;
+      const key = rootIds.join("|");
+      const group = groups.get(key) ?? [];
+      group.push(issueId);
+      groups.set(key, group);
+    }
+    return [...groups.values()].flatMap((group) => chunkList(group, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE));
+  };
+  while (frontier.length > 0 && !sharedBudgetExhausted) {
     const nextFrontier = new Set<string>();
+    // Charge each root for the batches its own frontier would require. Shared
+    // roots can split the physical SQL work into more provenance groups, but
+    // response shape must not spend additional budget for the same root graph.
+    const frontierNodeIdsByRootId = new Map<string, Set<string>>();
+    for (const issueId of new Set(frontier)) {
+      for (const rootId of rootIdsByNodeId.get(issueId) ?? []) {
+        if (truncatedRootIds.has(rootId)) continue;
+        const rootFrontier = frontierNodeIdsByRootId.get(rootId) ?? new Set<string>();
+        rootFrontier.add(issueId);
+        frontierNodeIdsByRootId.set(rootId, rootFrontier);
+      }
+    }
+    for (const [rootId, rootFrontier] of frontierNodeIdsByRootId) {
+      const requiredBatches = Math.ceil(rootFrontier.size / ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE);
+      const nextCount = (queryBatchCountByRootId.get(rootId) ?? 0) + requiredBatches;
+      if (nextCount > BLOCKER_ATTENTION_MAX_QUERY_BATCHES) {
+        for (const issueId of rootFrontier) markRootIncomplete(rootId, issueId);
+      } else {
+        queryBatchCountByRootId.set(rootId, nextCount);
+      }
+    }
 
-    for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    for (const chunk of frontierChunksByRootProvenance(frontier)) {
+      const admittedRootIdsByIssueId = new Map<string, Set<string>>();
+      const admittedChunk: string[] = [];
+      const chunkRootIds = new Set<string>();
+      for (const issueId of chunk) {
+        const admittedRootIds = new Set<string>();
+        for (const rootId of rootIdsByNodeId.get(issueId) ?? []) {
+          if (truncatedRootIds.has(rootId)) continue;
+          admittedRootIds.add(rootId);
+          chunkRootIds.add(rootId);
+        }
+        if (admittedRootIds.size > 0) {
+          admittedRootIdsByIssueId.set(issueId, admittedRootIds);
+          admittedChunk.push(issueId);
+        }
+      }
+      if (chunkRootIds.size === 0) continue;
+      if (sharedQueryBatchCount >= sharedQueryBatchLimit || sharedEdgeCount >= sharedEdgeDiscoveryLimit) {
+        for (const issueId of admittedChunk) markNodeIncomplete(issueId);
+        sharedBudgetExhausted = true;
+        break;
+      }
+      sharedQueryBatchCount += 1;
+      // A chunk can contain several independent roots. Bound returned rows by
+      // one per-source edge allowance, plus a sentinel row that proves the
+      // chunk was truncated. Root-local edge budgets below decide which roots
+      // can continue using the shared rows.
+      const chunkEdgeAllowance = Math.min(
+        sharedEdgeDiscoveryLimit - sharedEdgeCount,
+        BLOCKER_ATTENTION_MAX_EDGES * admittedChunk.length,
+      );
+      const rowLimit = chunkEdgeAllowance + 1;
       const explicitBlockerRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
         .select({
           issueId: issueRelations.relatedIssueId,
@@ -2074,11 +2248,13 @@ async function listIssueBlockerAttentionMap(
           and(
             eq(issueRelations.companyId, companyId),
             eq(issueRelations.type, "blocks"),
-            inArray(issueRelations.relatedIssueId, chunk),
+            inArray(issueRelations.relatedIssueId, admittedChunk),
             eq(issues.companyId, companyId),
             ne(issues.status, "done"),
           ),
-        );
+        )
+        .orderBy(asc(issueRelations.relatedIssueId), asc(issues.id))
+        .limit(rowLimit);
       const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
         .select({
           issueId: issues.parentId,
@@ -2097,48 +2273,125 @@ async function listIssueBlockerAttentionMap(
         .where(
           and(
             eq(issues.companyId, companyId),
-            inArray(issues.parentId, chunk),
+            inArray(issues.parentId, admittedChunk),
             notInArray(issues.status, BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES),
           ),
-        );
+        )
+        .orderBy(asc(issues.parentId), asc(issues.id))
+        .limit(rowLimit);
       const [explicitBlockerRows, childRows] = await Promise.all([
         explicitBlockerRowsPromise,
         childRowsPromise,
       ]);
 
-      appendBlockerAttentionEdges(edgesByIssueId, [
+      const candidateEdges = [
         ...explicitBlockerRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
           .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
         ...childRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
           .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
-      ]);
+      ];
+      const queryRowsTruncated = explicitBlockerRows.length >= rowLimit || childRows.length >= rowLimit;
+      let chunkEdgeCount = 0;
+      const acceptedRootIdsByEdgeKey = new Map<string, Set<string>>();
+      for (const edge of candidateEdges) {
+        const sourceRootIds = admittedRootIdsByIssueId.get(edge.issueId) ?? new Set<string>();
+        const acceptedRootIds = new Set<string>();
+        for (const rootId of sourceRootIds) {
+          if (truncatedRootIds.has(rootId)) continue;
+          const rootEdgeKeys = edgeKeysByRootId.get(rootId);
+          if (!rootEdgeKeys) continue;
+          const edgeKey = `${edge.issueId}:${edge.blockerIssueId}`;
+          if (rootEdgeKeys.has(edgeKey)) {
+            acceptedRootIds.add(rootId);
+            continue;
+          }
+          if (rootEdgeKeys.size >= BLOCKER_ATTENTION_MAX_EDGES) {
+            markRootIncomplete(rootId, edge.issueId);
+            continue;
+          }
+          rootEdgeKeys.add(edgeKey);
+          acceptedRootIds.add(rootId);
+        }
+        if (acceptedRootIds.size === 0) continue;
+        const existing = edgesByIssueId.get(edge.issueId) ?? [];
+        const edgeExists = existing.some((entry) => entry.blockerIssueId === edge.blockerIssueId);
+        if (!edgeExists && (chunkEdgeCount >= chunkEdgeAllowance || sharedEdgeCount >= sharedEdgeDiscoveryLimit)) {
+          for (const rootId of acceptedRootIds) markRootIncomplete(rootId, edge.issueId);
+          sharedBudgetExhausted = true;
+          continue;
+        }
+        if (!edgeExists) {
+          existing.push(edge);
+          edgesByIssueId.set(edge.issueId, existing);
+          chunkEdgeCount += 1;
+          sharedEdgeCount += 1;
+        }
+        acceptedRootIdsByEdgeKey.set(`${edge.issueId}:${edge.blockerIssueId}`, acceptedRootIds);
+      }
 
       for (const row of [...explicitBlockerRows, ...childRows]) {
-        if (!row.issueId || nodesById.has(row.blockerIssueId)) continue;
-        nodesById.set(row.blockerIssueId, {
-          id: row.blockerIssueId,
-          companyId: row.companyId,
-          parentId: row.parentId,
-          identifier: row.identifier,
-          title: row.title,
-          status: row.status,
-          executionRunId: row.executionRunId,
-          assigneeAgentId: row.assigneeAgentId,
-          assigneeUserId: row.assigneeUserId,
-        });
-        nextFrontier.add(row.blockerIssueId);
+        if (!row.issueId) continue;
+        const sourceRootIds = acceptedRootIdsByEdgeKey.get(`${row.issueId}:${row.blockerIssueId}`) ?? new Set<string>();
+        let propagatedRoot = false;
+        for (const rootId of sourceRootIds) {
+          if (truncatedRootIds.has(rootId)) continue;
+          const rootNodeIds = nodeIdsByRootId.get(rootId);
+          if (!rootNodeIds) continue;
+          if (!rootNodeIds.has(row.blockerIssueId)) {
+            if (rootNodeIds.size >= BLOCKER_ATTENTION_MAX_NODES) {
+              markRootIncomplete(rootId, row.issueId);
+              continue;
+            }
+            rootNodeIds.add(row.blockerIssueId);
+          }
+          if (incompleteNodeIds.has(row.blockerIssueId)) {
+            markRootIncomplete(rootId, row.blockerIssueId);
+            continue;
+          }
+          const blockerRootIds = rootIdsByNodeId.get(row.blockerIssueId) ?? new Set<string>();
+          blockerRootIds.add(rootId);
+          rootIdsByNodeId.set(row.blockerIssueId, blockerRootIds);
+          propagatedRoot = true;
+        }
+        if (!nodesById.has(row.blockerIssueId)) {
+          if (!propagatedRoot) continue;
+          if (nodesById.size >= sharedNodeDiscoveryLimit) {
+            for (const rootId of sourceRootIds) markRootIncomplete(rootId, row.issueId);
+            sharedBudgetExhausted = true;
+            continue;
+          }
+          nodesById.set(row.blockerIssueId, {
+            id: row.blockerIssueId,
+            companyId: row.companyId,
+            parentId: row.parentId,
+            identifier: row.identifier,
+            title: row.title,
+            status: row.status,
+            executionRunId: row.executionRunId,
+            assigneeAgentId: row.assigneeAgentId,
+            assigneeUserId: row.assigneeUserId,
+          });
+        }
+        if (propagatedRoot && !queriedNodeIds.has(row.blockerIssueId)) nextFrontier.add(row.blockerIssueId);
+      }
+      // Preserve the bounded rows above for diagnostics/counts, then fail every
+      // root reaching the source closed. Marking before row processing would
+      // discard all known direct edges and make truncation response-shape
+      // dependent again.
+      if (queryRowsTruncated) {
+        for (const issueId of admittedChunk) markNodeIncomplete(issueId);
+      }
+      if (sharedBudgetExhausted) {
+        for (const issueId of admittedChunk) markNodeIncomplete(issueId);
+        break;
       }
     }
 
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) {
-      truncated = true;
-      break;
-    }
+    for (const issueId of frontier) queriedNodeIds.add(issueId);
     frontier = [...nextFrontier];
   }
-  if (frontier.length > 0) truncated = true;
 
   const nodeIds = [...nodesById.keys()];
   const activeIssueIds = new Set<string>();
@@ -2271,17 +2524,26 @@ async function listIssueBlockerAttentionMap(
   type PathClassification = {
     covered: boolean;
     stalled: boolean;
+    // Longest path represented by this memoized result, including this node.
+    // Optional only for immediate one-node classifications.
+    maxDepth?: number;
     sampleBlockerIdentifier: string | null;
     sampleStalledBlockerIdentifier: string | null;
+    cycle?: boolean;
   };
-  const classifyPath = (
-    nodeId: string,
-    seen: Set<string>,
-  ): PathClassification => {
+  const hardAttentionClassification = (nodeId: string, cycle = false): PathClassification => ({
+    covered: false,
+    stalled: false,
+    maxDepth: cycle ? Number.POSITIVE_INFINITY : 1,
+    sampleBlockerIdentifier: blockerSampleIdentifier(nodesById.get(nodeId)) ?? nodeId,
+    sampleStalledBlockerIdentifier: null,
+    ...(cycle ? { cycle: true } : {}),
+  });
+  const downstreamIdsForNode = (nodeId: string) => (edgesByIssueId.get(nodeId) ?? [])
+    .filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done")
+    .map((edge) => edge.blockerIssueId);
+  const immediateClassification = (nodeId: string): PathClassification | null => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
-    if (truncated || seen.has(nodeId)) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null };
-    }
     const node = nodesById.get(nodeId);
     if (!node || node.companyId !== companyId) {
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeId, sampleStalledBlockerIdentifier: null };
@@ -2313,38 +2575,7 @@ async function listIssueBlockerAttentionMap(
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
 
-    const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
-    if (downstream.length > 0) {
-      const nextSeen = new Set(seen);
-      nextSeen.add(nodeId);
-      const classified = downstream.map((edge) => classifyPath(edge.blockerIssueId, nextSeen));
-      const stalledChild = classified.find((result) => result.stalled || result.sampleStalledBlockerIdentifier);
-      const sampleStalled = stalledChild?.sampleStalledBlockerIdentifier ?? null;
-      const hardAttention = classified.find((result) => !result.covered && !result.stalled);
-      if (hardAttention) {
-        return {
-          covered: false,
-          stalled: false,
-          sampleBlockerIdentifier: hardAttention.sampleBlockerIdentifier,
-          sampleStalledBlockerIdentifier: sampleStalled,
-        };
-      }
-      const stalledEntry = classified.find((result) => result.stalled);
-      if (stalledEntry) {
-        return {
-          covered: false,
-          stalled: true,
-          sampleBlockerIdentifier: stalledEntry.sampleBlockerIdentifier,
-          sampleStalledBlockerIdentifier: sampleStalled,
-        };
-      }
-      return {
-        covered: true,
-        stalled: false,
-        sampleBlockerIdentifier: classified[0]?.sampleBlockerIdentifier ?? nodeSample,
-        sampleStalledBlockerIdentifier: null,
-      };
-    }
+    if (downstreamIdsForNode(node.id).length > 0) return null;
 
     if (node.assigneeAgentId) {
       const assignee = agentsById.get(node.assigneeAgentId);
@@ -2354,6 +2585,158 @@ async function listIssueBlockerAttentionMap(
     }
 
     return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+  };
+  const aggregateClassification = (
+    nodeId: string,
+    classified: PathClassification[],
+  ): PathClassification => {
+    const nodeSample = blockerSampleIdentifier(nodesById.get(nodeId));
+    const stalledChild = classified.find((result) => result.stalled || result.sampleStalledBlockerIdentifier);
+    const sampleStalled = stalledChild?.sampleStalledBlockerIdentifier ?? null;
+    const cycle = classified.some((result) => result.cycle);
+    const maxDepth = 1 + Math.max(0, ...classified.map((result) => result.maxDepth ?? 1));
+    const hardAttention = classified.find((result) => !result.covered && !result.stalled);
+    if (hardAttention) {
+      return {
+        covered: false,
+        stalled: false,
+        maxDepth,
+        sampleBlockerIdentifier: hardAttention.sampleBlockerIdentifier,
+        sampleStalledBlockerIdentifier: sampleStalled,
+        ...(cycle ? { cycle: true } : {}),
+      };
+    }
+    const stalledEntry = classified.find((result) => result.stalled);
+    if (stalledEntry) {
+      return {
+        covered: false,
+        stalled: true,
+        maxDepth,
+        sampleBlockerIdentifier: stalledEntry.sampleBlockerIdentifier,
+        sampleStalledBlockerIdentifier: sampleStalled,
+        ...(cycle ? { cycle: true } : {}),
+      };
+    }
+    return {
+      covered: true,
+      stalled: false,
+      maxDepth,
+      sampleBlockerIdentifier: classified[0]?.sampleBlockerIdentifier ?? nodeSample,
+      sampleStalledBlockerIdentifier: null,
+    };
+  };
+  type ClassificationFrame = {
+    nodeId: string;
+    downstreamIds: string[];
+    nextIndex: number;
+    childResults: PathClassification[];
+  };
+  const classificationMemo = new Map<string, PathClassification>();
+  const classifyPath = (startNodeId: string): PathClassification => {
+    const cached = classificationMemo.get(startNodeId);
+    if (cached) return cached;
+    const immediate = immediateClassification(startNodeId);
+    if (immediate) {
+      classificationMemo.set(startNodeId, immediate);
+      return immediate;
+    }
+
+    const visiting = new Set<string>([startNodeId]);
+    const stack: ClassificationFrame[] = [{
+      nodeId: startNodeId,
+      downstreamIds: downstreamIdsForNode(startNodeId),
+      nextIndex: 0,
+      childResults: [],
+    }];
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!;
+      if (frame.nextIndex < frame.downstreamIds.length) {
+        const childId = frame.downstreamIds[frame.nextIndex++]!;
+        const childCached = classificationMemo.get(childId);
+        if (childCached) {
+          frame.childResults.push(childCached);
+          continue;
+        }
+        if (visiting.has(childId)) {
+          frame.childResults.push(hardAttentionClassification(childId, true));
+          continue;
+        }
+        const childImmediate = immediateClassification(childId);
+        if (childImmediate) {
+          classificationMemo.set(childId, childImmediate);
+          frame.childResults.push(childImmediate);
+          continue;
+        }
+        visiting.add(childId);
+        stack.push({
+          nodeId: childId,
+          downstreamIds: downstreamIdsForNode(childId),
+          nextIndex: 0,
+          childResults: [],
+        });
+        continue;
+      }
+
+      const result = aggregateClassification(frame.nodeId, frame.childResults);
+      classificationMemo.set(frame.nodeId, result);
+      visiting.delete(frame.nodeId);
+      stack.pop();
+      stack[stack.length - 1]?.childResults.push(result);
+    }
+    return classificationMemo.get(startNodeId) ?? hardAttentionClassification(startNodeId);
+  };
+
+  const rootGraphWithinLimits = (rootId: string): boolean => {
+    if (truncatedRootIds.has(rootId)) return false;
+    const rootIncompleteNodeIds = incompleteNodeIdsByRootId.get(rootId) ?? new Set<string>();
+    const reachable = new Set<string>([rootId]);
+    const discovery = [rootId];
+    let reachableEdgeCount = 0;
+    while (discovery.length > 0) {
+      const issueId = discovery.pop()!;
+      if (incompleteNodeIds.has(issueId) || rootIncompleteNodeIds.has(issueId)) return false;
+      for (const downstreamId of downstreamIdsForNode(issueId)) {
+        reachableEdgeCount += 1;
+        if (reachableEdgeCount > BLOCKER_ATTENTION_MAX_EDGES) return false;
+        if (reachable.has(downstreamId)) continue;
+        reachable.add(downstreamId);
+        if (reachable.size > BLOCKER_ATTENTION_MAX_NODES) return false;
+        discovery.push(downstreamId);
+      }
+    }
+
+    // Validate cycles and the longest root-to-node path independently from
+    // liveness. Immediate covered states may stop liveness classification, but
+    // must never hide an over-depth or cyclic graph.
+    const indegreeById = new Map([...reachable].map((issueId) => [issueId, 0]));
+    for (const issueId of reachable) {
+      for (const downstreamId of downstreamIdsForNode(issueId)) {
+        if (!reachable.has(downstreamId)) continue;
+        indegreeById.set(downstreamId, (indegreeById.get(downstreamId) ?? 0) + 1);
+      }
+    }
+    const pending = [...indegreeById]
+      .filter(([, indegree]) => indegree === 0)
+      .map(([issueId]) => issueId);
+    const maxDepthById = new Map<string, number>([[rootId, 0]]);
+    let processedCount = 0;
+    while (pending.length > 0) {
+      const issueId = pending.pop()!;
+      processedCount += 1;
+      const depth = maxDepthById.get(issueId) ?? 0;
+      if (depth > BLOCKER_ATTENTION_MAX_PATH_DEPTH) return false;
+      for (const downstreamId of downstreamIdsForNode(issueId)) {
+        if (!reachable.has(downstreamId)) continue;
+        maxDepthById.set(
+          downstreamId,
+          Math.max(maxDepthById.get(downstreamId) ?? 0, depth + 1),
+        );
+        const remainingIndegree = (indegreeById.get(downstreamId) ?? 1) - 1;
+        indegreeById.set(downstreamId, remainingIndegree);
+        if (remainingIndegree === 0) pending.push(downstreamId);
+      }
+    }
+    return processedCount === reachable.size;
   };
 
   for (const root of roots) {
@@ -2366,10 +2749,19 @@ async function listIssueBlockerAttentionMap(
       continue;
     }
 
-    const classified = topLevelEdges.map((edge) => ({
-      edge,
-      result: classifyPath(edge.blockerIssueId, new Set([root.id])),
-    }));
+    const rootGraphValid = rootGraphWithinLimits(root.id);
+    const classified = topLevelEdges.map((edge) => {
+      if (!rootGraphValid) {
+        return { edge, result: hardAttentionClassification(edge.blockerIssueId) };
+      }
+      const result = classifyPath(edge.blockerIssueId);
+      return {
+        edge,
+        result: (result.maxDepth ?? 1) > BLOCKER_ATTENTION_MAX_PATH_DEPTH
+          ? hardAttentionClassification(edge.blockerIssueId)
+          : result,
+      };
+    });
     const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
     const attentionBlockerCount = classified.length - coveredBlockerCount - stalledBlockerCount;
@@ -2403,7 +2795,9 @@ async function listIssueBlockerAttentionMap(
       coveredBlockerCount,
       stalledBlockerCount,
       attentionBlockerCount,
-      sampleBlockerIdentifier: sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode),
+      sampleBlockerIdentifier: sampleEntry?.result.cycle
+        ? blockerSampleIdentifier(sampleNode)
+        : sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode),
       sampleStalledBlockerIdentifier:
         stalledEntry?.result.sampleStalledBlockerIdentifier ?? sampleStalledFromChain ?? null,
     }));
@@ -4201,6 +4595,7 @@ export function issueService(db: Db) {
 
     const terminalByRoot = await terminalExplicitBlockersByRoot(
       companyId,
+      uniqueIssueIds,
       [...empty.values()].flatMap((relations) => relations.blockedBy),
       dbOrTx,
     );
