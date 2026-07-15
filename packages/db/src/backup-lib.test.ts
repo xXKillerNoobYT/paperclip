@@ -158,6 +158,34 @@ describe("atomic backup publication", () => {
     expect(fs.readFileSync(backupFile)).toEqual(competingArchive);
     expect(fs.existsSync(intermediateFile)).toBe(true);
   });
+
+  it("reports post-publication cleanup separately without failing the durable backup", async () => {
+    const tempDir = createTempDir("paperclip-publication-cleanup-");
+    const intermediateFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz.partial-run");
+    const backupFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz");
+    const archive = gzipSync("SELECT 'durable';\n");
+    fs.writeFileSync(intermediateFile, archive);
+
+    const realUnlinkSync = fs.unlinkSync;
+    const unlinkSpy = vi.spyOn(fs, "unlinkSync").mockImplementation((filePath) => {
+      if (filePath === intermediateFile) {
+        throw new Error("simulated cleanup failure");
+      }
+      return realUnlinkSync(filePath);
+    });
+    syncBuiltinESMExports();
+
+    try {
+      await expect(publishVerifiedGzip(intermediateFile, backupFile)).resolves.toEqual([intermediateFile]);
+    } finally {
+      unlinkSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+
+    await expect(verifyGzipFile(backupFile)).resolves.toBeUndefined();
+    expect(fs.readFileSync(backupFile)).toEqual(archive);
+    expect(fs.existsSync(intermediateFile)).toBe(true);
+  });
 });
 
 describe("integrity-aware backup retention", () => {

@@ -162,19 +162,27 @@ export async function verifyGzipFile(filePath: string): Promise<void> {
   );
 }
 
-export async function publishVerifiedGzip(intermediateFile: string, backupFile: string): Promise<void> {
+export async function publishVerifiedGzip(intermediateFile: string, backupFile: string): Promise<string[]> {
   try {
     await verifyGzipFile(intermediateFile);
     // A same-directory hard link publishes the fully written inode atomically and
     // fails with EEXIST rather than replacing a destination created by another run.
     linkSync(intermediateFile, backupFile);
-    unlinkSync(intermediateFile);
   } catch (error) {
     throw new DatabaseBackupError(
       `Backup archive validation or publication failed; retained intermediate: ${intermediateFile}`,
       existsSync(intermediateFile) ? [intermediateFile] : [],
       error,
     );
+  }
+
+  try {
+    unlinkSync(intermediateFile);
+    return [];
+  } catch {
+    // Publication is already durable. Report cleanup separately instead of
+    // converting a valid backup into a failed run.
+    return existsSync(intermediateFile) ? [intermediateFile] : [];
   }
 }
 
@@ -720,7 +728,15 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           backupFile: compressedFile,
           connectTimeout,
         });
-        await publishVerifiedGzip(compressedFile, backupFile);
+        const publicationCleanupArtifacts = await publishVerifiedGzip(compressedFile, backupFile);
+        for (const retainedArtifact of publicationCleanupArtifacts) {
+          emitDiagnostic({
+            code: "cleanup_failed",
+            backupFile,
+            message: "Failed to remove the run-owned gzip intermediate after publication",
+            retainedArtifacts: [retainedArtifact],
+          });
+        }
         await writer.abort();
         if (existsSync(sqlFile)) {
           emitDiagnostic({
@@ -1141,7 +1157,15 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     const sqlReadStream = createReadStream(sqlFile);
     const gzWriteStream = createWriteStream(compressedFile);
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    await publishVerifiedGzip(compressedFile, backupFile);
+    const publicationCleanupArtifacts = await publishVerifiedGzip(compressedFile, backupFile);
+    for (const retainedArtifact of publicationCleanupArtifacts) {
+      emitDiagnostic({
+        code: "cleanup_failed",
+        backupFile,
+        message: "Failed to remove the run-owned gzip intermediate after publication",
+        retainedArtifacts: [retainedArtifact],
+      });
+    }
     cleanupPublishedIntermediate(sqlFile);
     for (const failedArtifact of failedEngineArtifacts) {
       cleanupPublishedIntermediate(failedArtifact);
