@@ -2128,19 +2128,35 @@ async function listIssueBlockerAttentionMap(
 
   let frontier = roots.map((root) => root.id);
   const budgetNodeIds = new Set(frontier);
-  let truncated = budgetNodeIds.size > BLOCKER_ATTENTION_MAX_NODES;
+  // Discovery is shared so bulk reads can reuse intermediate roots, but work
+  // allowances scale with the number of roots. Each root is validated against
+  // the fixed per-root ceilings below; unrelated roots therefore cannot consume
+  // another root's node/edge/query allowance or change its classification.
+  const aggregateNodeLimit = BLOCKER_ATTENTION_MAX_NODES * roots.length;
+  const aggregateEdgeLimit = BLOCKER_ATTENTION_MAX_EDGES * roots.length;
+  const aggregateQueryBatchLimit = BLOCKER_ATTENTION_MAX_QUERY_BATCHES * roots.length;
+  let globalBudgetExhausted = budgetNodeIds.size > aggregateNodeLimit;
+  const incompleteNodeIds = new Set<string>();
   let queryBatchCount = 0;
   let edgeCount = 0;
-  while (frontier.length > 0 && !truncated) {
+  while (frontier.length > 0 && !globalBudgetExhausted) {
     const nextFrontier = new Set<string>();
 
     for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
-      if (queryBatchCount >= BLOCKER_ATTENTION_MAX_QUERY_BATCHES || edgeCount >= BLOCKER_ATTENTION_MAX_EDGES) {
-        truncated = true;
+      if (queryBatchCount >= aggregateQueryBatchLimit || edgeCount >= aggregateEdgeLimit) {
+        for (const issueId of frontier) incompleteNodeIds.add(issueId);
+        globalBudgetExhausted = true;
         break;
       }
       queryBatchCount += 1;
-      const rowLimit = BLOCKER_ATTENTION_MAX_EDGES - edgeCount + 1;
+      // A chunk can contain several independent roots. Bound returned rows by
+      // one per-root edge allowance for each source node in the chunk, plus a
+      // sentinel row that proves the chunk was truncated.
+      const chunkEdgeAllowance = Math.min(
+        aggregateEdgeLimit - edgeCount,
+        BLOCKER_ATTENTION_MAX_EDGES * chunk.length,
+      );
+      const rowLimit = chunkEdgeAllowance + 1;
       const explicitBlockerRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
         .select({
           issueId: issueRelations.relatedIssueId,
@@ -2205,24 +2221,29 @@ async function listIssueBlockerAttentionMap(
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
           .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
       ];
-      if (explicitBlockerRows.length >= rowLimit || childRows.length >= rowLimit) truncated = true;
+      if (explicitBlockerRows.length >= rowLimit || childRows.length >= rowLimit) {
+        for (const issueId of chunk) incompleteNodeIds.add(issueId);
+      }
+      let chunkEdgeCount = 0;
       for (const edge of candidateEdges) {
         const existing = edgesByIssueId.get(edge.issueId) ?? [];
         if (existing.some((entry) => entry.blockerIssueId === edge.blockerIssueId)) continue;
-        if (edgeCount >= BLOCKER_ATTENTION_MAX_EDGES) {
-          truncated = true;
+        if (chunkEdgeCount >= chunkEdgeAllowance || edgeCount >= aggregateEdgeLimit) {
+          incompleteNodeIds.add(edge.issueId);
           continue;
         }
         existing.push(edge);
         edgesByIssueId.set(edge.issueId, existing);
+        chunkEdgeCount += 1;
         edgeCount += 1;
       }
 
       for (const row of [...explicitBlockerRows, ...childRows]) {
         if (!row.issueId) continue;
         if (!budgetNodeIds.has(row.blockerIssueId)) {
-          if (budgetNodeIds.size >= BLOCKER_ATTENTION_MAX_NODES) {
-            truncated = true;
+          if (budgetNodeIds.size >= aggregateNodeLimit) {
+            incompleteNodeIds.add(row.issueId);
+            globalBudgetExhausted = true;
             continue;
           }
           budgetNodeIds.add(row.blockerIssueId);
@@ -2241,10 +2262,10 @@ async function listIssueBlockerAttentionMap(
         });
         nextFrontier.add(row.blockerIssueId);
       }
-      // Once the node budget is exhausted, keep scanning the current frontier.
-      // Bulk reads may have already budgeted nodes in later chunks, and their
-      // edges must still be recorded so response shape cannot change counts.
-      // The truncated flag prevents admitting nodes and expanding another wave.
+      if (globalBudgetExhausted) {
+        for (const issueId of frontier) incompleteNodeIds.add(issueId);
+        break;
+      }
     }
 
     frontier = [...nextFrontier];
@@ -2401,9 +2422,6 @@ async function listIssueBlockerAttentionMap(
     .map((edge) => edge.blockerIssueId);
   const immediateClassification = (nodeId: string): PathClassification | null => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
-    if (truncated) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null };
-    }
     const node = nodesById.get(nodeId);
     if (!node || node.companyId !== companyId) {
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeId, sampleStalledBlockerIdentifier: null };
@@ -2546,6 +2564,57 @@ async function listIssueBlockerAttentionMap(
     return classificationMemo.get(startNodeId) ?? hardAttentionClassification(startNodeId);
   };
 
+  const rootGraphWithinLimits = (rootId: string): boolean => {
+    const reachable = new Set<string>([rootId]);
+    const discovery = [rootId];
+    let reachableEdgeCount = 0;
+    while (discovery.length > 0) {
+      const issueId = discovery.pop()!;
+      if (incompleteNodeIds.has(issueId)) return false;
+      for (const downstreamId of downstreamIdsForNode(issueId)) {
+        reachableEdgeCount += 1;
+        if (reachableEdgeCount > BLOCKER_ATTENTION_MAX_EDGES) return false;
+        if (reachable.has(downstreamId)) continue;
+        reachable.add(downstreamId);
+        if (reachable.size > BLOCKER_ATTENTION_MAX_NODES) return false;
+        discovery.push(downstreamId);
+      }
+    }
+
+    // Validate cycles and the longest root-to-node path independently from
+    // liveness. Immediate covered states may stop liveness classification, but
+    // must never hide an over-depth or cyclic graph.
+    const indegreeById = new Map([...reachable].map((issueId) => [issueId, 0]));
+    for (const issueId of reachable) {
+      for (const downstreamId of downstreamIdsForNode(issueId)) {
+        if (!reachable.has(downstreamId)) continue;
+        indegreeById.set(downstreamId, (indegreeById.get(downstreamId) ?? 0) + 1);
+      }
+    }
+    const pending = [...indegreeById]
+      .filter(([, indegree]) => indegree === 0)
+      .map(([issueId]) => issueId);
+    const maxDepthById = new Map<string, number>([[rootId, 0]]);
+    let processedCount = 0;
+    while (pending.length > 0) {
+      const issueId = pending.pop()!;
+      processedCount += 1;
+      const depth = maxDepthById.get(issueId) ?? 0;
+      if (depth > BLOCKER_ATTENTION_MAX_PATH_DEPTH) return false;
+      for (const downstreamId of downstreamIdsForNode(issueId)) {
+        if (!reachable.has(downstreamId)) continue;
+        maxDepthById.set(
+          downstreamId,
+          Math.max(maxDepthById.get(downstreamId) ?? 0, depth + 1),
+        );
+        const remainingIndegree = (indegreeById.get(downstreamId) ?? 1) - 1;
+        indegreeById.set(downstreamId, remainingIndegree);
+        if (remainingIndegree === 0) pending.push(downstreamId);
+      }
+    }
+    return processedCount === reachable.size;
+  };
+
   for (const root of roots) {
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
     if (topLevelEdges.length === 0) {
@@ -2556,7 +2625,11 @@ async function listIssueBlockerAttentionMap(
       continue;
     }
 
+    const rootGraphValid = rootGraphWithinLimits(root.id);
     const classified = topLevelEdges.map((edge) => {
+      if (!rootGraphValid) {
+        return { edge, result: hardAttentionClassification(edge.blockerIssueId) };
+      }
       const result = classifyPath(edge.blockerIssueId);
       return {
         edge,

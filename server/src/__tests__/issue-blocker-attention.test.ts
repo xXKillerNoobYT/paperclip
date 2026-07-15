@@ -368,6 +368,64 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     ]);
   }, 15_000);
 
+  it("keeps a root independent of unrelated blocked roots consuming the shared node budget", async () => {
+    const { companyId } = await createCompany("PBRU");
+    const rootId = await insertIssue({
+      companyId,
+      identifier: "PBRU-1",
+      title: "Target root",
+      status: "blocked",
+    });
+    const coveredLeaves = Array.from({ length: 1500 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBRU-L${index + 1}`,
+      title: `Covered leaf ${index + 1}`,
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeUserId: "board-reviewer",
+      originKind: "manual",
+      originFingerprint: `root-unrelated-leaf-${index}`,
+    }));
+    const unrelatedRoots = Array.from({ length: 500 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBRU-U${index + 1}`,
+      title: `Unrelated blocked root ${index + 1}`,
+      status: "blocked" as const,
+      priority: "medium" as const,
+      originKind: "manual",
+      originFingerprint: `root-unrelated-${index}`,
+    }));
+    for (const rows of [coveredLeaves, unrelatedRoots]) {
+      for (let index = 0; index < rows.length; index += 500) {
+        await db.insert(issues).values(rows.slice(index, index + 500));
+      }
+    }
+    const relationRows = coveredLeaves.map((row) => ({
+      companyId,
+      issueId: row.id,
+      relatedIssueId: rootId,
+      type: "blocks" as const,
+    }));
+    for (let index = 0; index < relationRows.length; index += 500) {
+      await db.insert(issueRelations).values(relationRows.slice(index, index + 500));
+    }
+
+    const root = await svc.getById(rootId);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(rootId);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked", limit: 1000 }))
+      .find((issue) => issue.id === rootId);
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "covered",
+      unresolvedBlockerCount: 1500,
+      coveredBlockerCount: 1500,
+      attentionBlockerCount: 0,
+    });
+  }, 30_000);
+
   it("classifies a chain at the exact traversal depth ceiling identically for single and bulk reads", async () => {
     const { companyId } = await createCompany("PBRC");
     const chainRows = Array.from({ length: 513 }, (_, index) => ({
@@ -510,6 +568,42 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       attentionBlockerCount: 1,
     });
     expect(relations.blockedBy).toHaveLength(1);
+    expect(relations.blockedBy[0]?.terminalBlockers).toBeUndefined();
+  }, 20_000);
+
+  it("fails closed beyond the depth budget even when the direct blocker is human-owned", async () => {
+    const { companyId } = await createCompany("PBHD");
+    const chainRows = Array.from({ length: 514 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBHD-${index + 1}`,
+      title: index === 513 ? "Terminal human review" : `Blocked chain ${index + 1}`,
+      status: index === 513 ? "in_review" as const : "blocked" as const,
+      priority: "medium" as const,
+      assigneeUserId: index === 1 || index === 513 ? "board-reviewer" : null,
+      originKind: "manual",
+      originFingerprint: `human-depth-${index}`,
+    }));
+    await db.insert(issues).values(chainRows);
+    await db.insert(issueRelations).values(chainRows.slice(1).map((row, index) => ({
+      companyId,
+      issueId: row.id,
+      relatedIssueId: chainRows[index]!.id,
+      type: "blocks" as const,
+    })));
+
+    const root = await svc.getById(chainRows[0]!.id);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(chainRows[0]!.id);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked" }))
+      .find((issue) => issue.id === chainRows[0]!.id);
+    const relations = await svc.getRelationSummaries(chainRows[0]!.id);
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "needs_attention",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
     expect(relations.blockedBy[0]?.terminalBlockers).toBeUndefined();
   }, 20_000);
 
