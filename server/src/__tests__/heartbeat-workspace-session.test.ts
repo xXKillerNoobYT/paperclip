@@ -69,6 +69,7 @@ function buildWorkspaceValidationInput(
   return {
     adapterType: "codex_local",
     agentId: "agent-1",
+    requestedExecutionWorkspaceMode: "shared_workspace",
     issue: {
       id: "issue-1",
       identifier: "PAP-1",
@@ -345,6 +346,34 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
       "fallback_agent_home_cwd",
       "would launch from agent fallback cwd",
     );
+  });
+
+  it("allows an explicitly repo-free agent-default issue to launch from the agent fallback cwd", async () => {
+    const input = buildWorkspaceValidationInput();
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    await expect(assertGitSensitiveAdapterWorkspaceValid(
+      buildWorkspaceValidationInput({
+        adapterType: "hermes_local",
+        requestedExecutionWorkspaceMode: "agent_default",
+        resolvedWorkspace: buildResolvedWorkspace({
+          cwd: fallbackCwd,
+          source: "agent_home",
+          workspaceId: null,
+        }),
+        executionWorkspace: {
+          ...input.executionWorkspace,
+          baseCwd: fallbackCwd,
+          source: "agent_home",
+          workspaceId: null,
+          cwd: fallbackCwd,
+        },
+        persistedExecutionWorkspace: {
+          ...input.persistedExecutionWorkspace!,
+          cwd: fallbackCwd,
+        },
+      }),
+    )).resolves.toBeUndefined();
   });
 
   it("rejects a git worktree persisted workspace when cwd differs from providerRef", async () => {

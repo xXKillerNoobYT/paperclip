@@ -1557,6 +1557,7 @@ export async function assertPushCapabilityCheckoutValid(input: {
 export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   adapterType: string;
   agentId: string;
+  requestedExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode>;
   issue: {
     id: string;
     identifier: string | null;
@@ -1588,9 +1589,11 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
   const persistedCwd = readNonEmptyString(input.persistedExecutionWorkspace?.cwd);
   const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
+  const expectsLinkedProjectWorkspace =
+    input.requestedExecutionWorkspaceMode !== "agent_default" &&
+    (Boolean(issue.projectWorkspaceId) || Boolean(input.resolvedWorkspace.workspaceId));
   const workspaceExpectation =
-    Boolean(issue.projectWorkspaceId) ||
-    Boolean(input.resolvedWorkspace.workspaceId) ||
+    expectsLinkedProjectWorkspace ||
     input.executionWorkspace.strategy === "git_worktree";
 
   const fail = (reason: string, message: string, extra: Record<string, unknown> = {}) => {
@@ -1621,7 +1624,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     });
   };
 
-  if (issue.projectWorkspaceId && !issue.projectId) {
+  if (expectsLinkedProjectWorkspace && issue.projectWorkspaceId && !issue.projectId) {
     fail(
       "missing_project_id",
       `Issue ${issue.identifier ?? issue.id} is linked to a project workspace but has no project id; refusing to launch ${input.adapterType} from fallback cwd.`,
@@ -1656,7 +1659,9 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  const expectedProjectWorkspaceId = issue.projectWorkspaceId ?? input.resolvedWorkspace.workspaceId ?? null;
+  const expectedProjectWorkspaceId = expectsLinkedProjectWorkspace
+    ? issue.projectWorkspaceId ?? input.resolvedWorkspace.workspaceId ?? null
+    : null;
   if (
     expectedProjectWorkspaceId &&
     input.persistedExecutionWorkspace &&
@@ -12758,6 +12763,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await assertGitSensitiveAdapterWorkspaceValid({
         adapterType: agent.adapterType,
         agentId: agent.id,
+        requestedExecutionWorkspaceMode,
         issue: issueRef
           ? {
               id: issueRef.id,
