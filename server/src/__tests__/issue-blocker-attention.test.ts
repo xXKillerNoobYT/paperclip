@@ -426,6 +426,300 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   }, 30_000);
 
+  it("keeps a small covered root independent when an unrelated root exhausts per-root budgets", async () => {
+    const { companyId } = await createCompany("PBPL");
+    const targetRootId = await insertIssue({
+      companyId,
+      identifier: "PBPL-1",
+      title: "Target root",
+      status: "blocked",
+    });
+    const oversizedRootId = await insertIssue({
+      companyId,
+      identifier: "PBPL-2",
+      title: "Oversized unrelated root",
+      status: "blocked",
+    });
+    const targetLeafId = await insertIssue({
+      companyId,
+      identifier: "PBPL-3",
+      title: "Target human review",
+      status: "in_review",
+      assigneeUserId: "board-reviewer",
+    });
+    const unrelatedLeaves = Array.from({ length: 3998 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBPL-U${index + 1}`,
+      title: `Unrelated covered leaf ${index + 1}`,
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeUserId: "board-reviewer",
+      originKind: "manual",
+      originFingerprint: `poison-leaf-${index}`,
+    }));
+    for (let index = 0; index < unrelatedLeaves.length; index += 500) {
+      await db.insert(issues).values(unrelatedLeaves.slice(index, index + 500));
+    }
+    const relationRows = [
+      {
+        companyId,
+        issueId: targetLeafId,
+        relatedIssueId: targetRootId,
+        type: "blocks" as const,
+      },
+      ...unrelatedLeaves.map((row) => ({
+        companyId,
+        issueId: row.id,
+        relatedIssueId: oversizedRootId,
+        type: "blocks" as const,
+      })),
+    ];
+    for (let index = 0; index < relationRows.length; index += 500) {
+      await db.insert(issueRelations).values(relationRows.slice(index, index + 500));
+    }
+
+    const targetRoot = await svc.getById(targetRootId);
+    const oversizedRoot = await svc.getById(oversizedRootId);
+    expect(targetRoot).not.toBeNull();
+    expect(oversizedRoot).not.toBeNull();
+
+    const individualAttention = (await svc.listBlockerAttention(companyId, [targetRoot!])).get(targetRootId);
+    const oversizedIndividualAttention = (await svc.listBlockerAttention(companyId, [oversizedRoot!]))
+      .get(oversizedRootId);
+    const bulkRows = await svc.list(companyId, { status: "blocked" });
+    const targetBulkAttention = bulkRows.find((issue) => issue.id === targetRootId)?.blockerAttention;
+    const oversizedBulkAttention = bulkRows.find((issue) => issue.id === oversizedRootId)?.blockerAttention;
+
+    expect(targetBulkAttention).toEqual(individualAttention);
+    expect(targetBulkAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBPL-3",
+    });
+    expect(oversizedBulkAttention).toEqual(oversizedIndividualAttention);
+    expect(oversizedBulkAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 3998,
+    });
+  }, 30_000);
+
+  it("carries incomplete shared-node provenance to roots that reach the node later", async () => {
+    const { companyId } = await createCompany("PBSN");
+    const oversizedRootId = await insertIssue({
+      companyId,
+      identifier: "PBSN-1",
+      title: "Oversized root",
+      status: "blocked",
+    });
+    const targetRootId = await insertIssue({
+      companyId,
+      identifier: "PBSN-2",
+      title: "Late target root",
+      status: "blocked",
+    });
+    const sharedNodeId = await insertIssue({
+      companyId,
+      identifier: "PBSN-3",
+      title: "Shared oversized node",
+      status: "blocked",
+    });
+    const targetMiddleId = await insertIssue({
+      companyId,
+      identifier: "PBSN-4",
+      title: "Target middle",
+      status: "blocked",
+    });
+    const sharedLeaves = Array.from({ length: 4001 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBSN-L${index + 1}`,
+      title: `Shared covered leaf ${index + 1}`,
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeUserId: "board-reviewer",
+      originKind: "manual",
+      originFingerprint: `shared-incomplete-${index}`,
+    }));
+    for (let index = 0; index < sharedLeaves.length; index += 500) {
+      await db.insert(issues).values(sharedLeaves.slice(index, index + 500));
+    }
+    const relationRows = [
+      { companyId, issueId: sharedNodeId, relatedIssueId: oversizedRootId, type: "blocks" as const },
+      { companyId, issueId: targetMiddleId, relatedIssueId: targetRootId, type: "blocks" as const },
+      { companyId, issueId: sharedNodeId, relatedIssueId: targetMiddleId, type: "blocks" as const },
+      ...sharedLeaves.map((row) => ({
+        companyId,
+        issueId: row.id,
+        relatedIssueId: sharedNodeId,
+        type: "blocks" as const,
+      })),
+    ];
+    for (let index = 0; index < relationRows.length; index += 500) {
+      await db.insert(issueRelations).values(relationRows.slice(index, index + 500));
+    }
+
+    const oversizedRoot = await svc.getById(oversizedRootId);
+    const targetRoot = await svc.getById(targetRootId);
+    expect(oversizedRoot).not.toBeNull();
+    expect(targetRoot).not.toBeNull();
+
+    const individualAttention = (await svc.listBlockerAttention(companyId, [targetRoot!])).get(targetRootId);
+    const bulkAttention = await svc.listBlockerAttention(companyId, [oversizedRoot!, targetRoot!]);
+    const targetBulkAttention = bulkAttention.get(targetRootId);
+
+    expect(targetBulkAttention).toEqual(individualAttention);
+    expect(targetBulkAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
+  }, 30_000);
+
+  it("does not let a truncated oversized root consume shared discovery needed by a later bounded root", async () => {
+    const { companyId } = await createCompany("PBND");
+    const oversizedRootId = await insertIssue({
+      companyId,
+      identifier: "PBND-1",
+      title: "Oversized root",
+      status: "blocked",
+    });
+    const targetRootId = await insertIssue({
+      companyId,
+      identifier: "PBND-2",
+      title: "Bounded target root",
+      status: "blocked",
+    });
+    const targetLeafId = await insertIssue({
+      companyId,
+      identifier: "PBND-3",
+      title: "Bounded target review",
+      status: "in_review",
+      assigneeUserId: "board-reviewer",
+    });
+    const oversizedLeaves = Array.from({ length: 4001 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBND-U${index + 1}`,
+      title: `Oversized leaf ${index + 1}`,
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeUserId: "board-reviewer",
+      originKind: "manual",
+      originFingerprint: `no-discovery-poison-${index}`,
+    }));
+    for (let index = 0; index < oversizedLeaves.length; index += 500) {
+      await db.insert(issues).values(oversizedLeaves.slice(index, index + 500));
+    }
+    const relationRows = [
+      { companyId, issueId: targetLeafId, relatedIssueId: targetRootId, type: "blocks" as const },
+      ...oversizedLeaves.map((row) => ({
+        companyId,
+        issueId: row.id,
+        relatedIssueId: oversizedRootId,
+        type: "blocks" as const,
+      })),
+    ];
+    for (let index = 0; index < relationRows.length; index += 500) {
+      await db.insert(issueRelations).values(relationRows.slice(index, index + 500));
+    }
+
+    const targetRoot = await svc.getById(targetRootId);
+    expect(targetRoot).not.toBeNull();
+
+    const individualAttention = (await svc.listBlockerAttention(companyId, [targetRoot!])).get(targetRootId);
+    const bulkRows = await svc.list(companyId, { status: "blocked" });
+    const targetBulkAttention = bulkRows.find((issue) => issue.id === targetRootId)?.blockerAttention;
+    const oversizedBulkAttention = bulkRows.find((issue) => issue.id === oversizedRootId)?.blockerAttention;
+
+    expect(targetBulkAttention).toEqual(individualAttention);
+    expect(targetBulkAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBND-3",
+    });
+    expect(oversizedBulkAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 4000,
+    });
+  }, 30_000);
+
+  it("does not charge a root extra query budget when overlapping roots split its frontier", async () => {
+    const { companyId } = await createCompany("PBQG");
+    const targetRootId = await insertIssue({
+      companyId,
+      identifier: "PBQG-1",
+      title: "Target root",
+      status: "blocked",
+    });
+    const sharedLeaves = Array.from({ length: 517 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBQG-L${index + 1}`,
+      title: `Shared covered leaf ${index + 1}`,
+      status: "in_review" as const,
+      priority: "medium" as const,
+      assigneeUserId: "board-reviewer",
+      originKind: "manual",
+      originFingerprint: `query-group-leaf-${index}`,
+    }));
+    const overlappingRoots = sharedLeaves.map((_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBQG-R${index + 1}`,
+      title: `Overlapping root ${index + 1}`,
+      status: "blocked" as const,
+      priority: "medium" as const,
+      originKind: "manual",
+      originFingerprint: `query-group-root-${index}`,
+    }));
+    await db.insert(issues).values([...sharedLeaves, ...overlappingRoots]);
+    await db.insert(issueRelations).values([
+      ...sharedLeaves.map((leaf) => ({
+        companyId,
+        issueId: leaf.id,
+        relatedIssueId: targetRootId,
+        type: "blocks" as const,
+      })),
+      ...sharedLeaves.map((leaf, index) => ({
+        companyId,
+        issueId: leaf.id,
+        relatedIssueId: overlappingRoots[index]!.id,
+        type: "blocks" as const,
+      })),
+    ]);
+
+    const targetRoot = await svc.getById(targetRootId);
+    expect(targetRoot).not.toBeNull();
+    const individualAttention = (await svc.listBlockerAttention(companyId, [targetRoot!])).get(targetRootId);
+    const bulkRoots = [targetRoot!, ...await Promise.all(overlappingRoots.map((root) => svc.getById(root.id)))]
+      .filter((root): root is NonNullable<typeof root> => root !== null);
+    const bulkAttention = (await svc.listBlockerAttention(companyId, bulkRoots)).get(targetRootId);
+
+    expect(bulkAttention).toEqual(individualAttention);
+    expect(bulkAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 517,
+      coveredBlockerCount: 517,
+      attentionBlockerCount: 0,
+    });
+  }, 30_000);
+
   it("classifies a chain at the exact traversal depth ceiling identically for single and bulk reads", async () => {
     const { companyId } = await createCompany("PBRC");
     const chainRows = Array.from({ length: 513 }, (_, index) => ({
