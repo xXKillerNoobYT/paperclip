@@ -3,8 +3,8 @@ import {
   createReadStream,
   createWriteStream,
   existsSync,
+  linkSync,
   mkdirSync,
-  readFileSync,
   readdirSync,
   renameSync,
   statSync,
@@ -165,10 +165,10 @@ export async function verifyGzipFile(filePath: string): Promise<void> {
 export async function publishVerifiedGzip(intermediateFile: string, backupFile: string): Promise<void> {
   try {
     await verifyGzipFile(intermediateFile);
-    if (existsSync(backupFile)) {
-      throw new Error(`Refusing to replace existing backup archive: ${backupFile}`);
-    }
-    renameSync(intermediateFile, backupFile);
+    // A same-directory hard link publishes the fully written inode atomically and
+    // fails with EEXIST rather than replacing a destination created by another run.
+    linkSync(intermediateFile, backupFile);
+    unlinkSync(intermediateFile);
   } catch (error) {
     throw new DatabaseBackupError(
       `Backup archive validation or publication failed; retained intermediate: ${intermediateFile}`,
@@ -183,39 +183,17 @@ function automaticBackupPattern(filenamePrefix: string): RegExp {
   return new RegExp(`^${escapedPrefix}-\\d{8}-\\d{6}(?:-[0-9a-f-]{36})?\\.sql\\.gz$`);
 }
 
-type BackupIntegrityCacheEntry = {
+type BackupIntegrityCheckEntry = {
   name: string;
   sizeBytes: number;
   mtimeMs: number;
   valid: boolean;
 };
 
-function readIntegrityCache(backupDir: string): Map<string, BackupIntegrityCacheEntry> {
-  const markerFile = resolve(backupDir, BACKUP_INTEGRITY_FAILURE_MARKER);
-  if (!existsSync(markerFile)) return new Map();
-  try {
-    const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { checkedArchives?: unknown };
-    if (!Array.isArray(parsed.checkedArchives)) return new Map();
-    return new Map(parsed.checkedArchives.flatMap((value) => {
-      if (!value || typeof value !== "object") return [];
-      const entry = value as Partial<BackupIntegrityCacheEntry>;
-      if (
-        typeof entry.name !== "string" ||
-        typeof entry.sizeBytes !== "number" ||
-        typeof entry.mtimeMs !== "number" ||
-        typeof entry.valid !== "boolean"
-      ) return [];
-      return [[entry.name, entry as BackupIntegrityCacheEntry]];
-    }));
-  } catch {
-    return new Map();
-  }
-}
-
 function writeIntegrityFailureMarker(
   backupDir: string,
   invalidBackupFiles: string[],
-  checkedArchives: BackupIntegrityCacheEntry[],
+  checkedArchives: BackupIntegrityCheckEntry[],
   checkedAt: Date,
 ): void {
   const markerFile = resolve(backupDir, BACKUP_INTEGRITY_FAILURE_MARKER);
@@ -250,25 +228,21 @@ export async function pruneOldBackups(
   const entries: BackupEntry[] = [];
 
   const invalidBackupFiles: string[] = [];
-  const checkedArchives: BackupIntegrityCacheEntry[] = [];
-  const integrityCache = readIntegrityCache(backupDir);
+  const checkedArchives: BackupIntegrityCheckEntry[] = [];
   const automaticPattern = automaticBackupPattern(filenamePrefix);
   for (const name of readdirSync(backupDir)) {
     if (!automaticPattern.test(name)) continue;
     const fullPath = resolve(backupDir, name);
     const stat = statSync(fullPath);
     if (!stat.isFile()) continue;
-    const cached = integrityCache.get(name);
-    let valid = cached?.sizeBytes === stat.size && cached.mtimeMs === stat.mtimeMs
-      ? cached.valid
-      : false;
-    if (!cached || cached.sizeBytes !== stat.size || cached.mtimeMs !== stat.mtimeMs) {
-      try {
-        await verifyGzipFile(fullPath);
-        valid = true;
-      } catch {
-        valid = false;
-      }
+    let valid = false;
+    try {
+      // Retention decisions must be based on current archive contents. Mutable
+      // filename/size/mtime metadata cannot safely stand in for gzip validity.
+      await verifyGzipFile(fullPath);
+      valid = true;
+    } catch {
+      valid = false;
     }
     checkedArchives.push({ name, sizeBytes: stat.size, mtimeMs: stat.mtimeMs, valid });
     if (!valid) {

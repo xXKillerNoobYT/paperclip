@@ -1,8 +1,9 @@
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import {
   createBufferedTextFileWriter,
@@ -128,6 +129,35 @@ describe("atomic backup publication", () => {
     expect(fs.readFileSync(backupFile)).toEqual(firstArchive);
     expect(fs.existsSync(intermediateFile)).toBe(true);
   });
+
+  it("never overwrites a destination created between validation and publication", async () => {
+    const tempDir = createTempDir("paperclip-publication-race-");
+    const intermediateFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz.partial-run");
+    const backupFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz");
+    const competingArchive = gzipSync("SELECT 'competing writer';\n");
+    fs.writeFileSync(intermediateFile, gzipSync("SELECT 'this run';\n"));
+
+    const realLinkSync = fs.linkSync;
+    const linkSpy = vi.spyOn(fs, "linkSync").mockImplementation((existingPath, newPath) => {
+      if (existingPath === intermediateFile && newPath === backupFile) {
+        fs.writeFileSync(backupFile, competingArchive);
+      }
+      return realLinkSync(existingPath, newPath);
+    });
+    syncBuiltinESMExports();
+
+    try {
+      await expect(publishVerifiedGzip(intermediateFile, backupFile)).rejects.toMatchObject({
+        retainedArtifacts: [intermediateFile],
+      });
+    } finally {
+      linkSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+
+    expect(fs.readFileSync(backupFile)).toEqual(competingArchive);
+    expect(fs.existsSync(intermediateFile)).toBe(true);
+  });
 });
 
 describe("integrity-aware backup retention", () => {
@@ -182,6 +212,55 @@ describe("integrity-aware backup retention", () => {
 
     expect(result.prunedCount).toBe(0);
     expect(fs.existsSync(onlyBackup)).toBe(true);
+  });
+
+  it("revalidates cached archives before pruning below the 24-valid floor", async () => {
+    const tempDir = createTempDir("paperclip-backup-stale-cache-");
+    const now = new Date("2026-07-15T12:00:00.000Z");
+
+    for (let index = 0; index < 25; index += 1) {
+      const stamp = String(index).padStart(2, "0");
+      const filePath = path.join(tempDir, `paperclip-20260501-00${stamp}00.sql.gz`);
+      fs.writeFileSync(filePath, gzipSync(`SELECT ${index};\n`));
+      const mtime = new Date(now.getTime() - (60 + index) * 86_400_000);
+      fs.utimesSync(filePath, mtime, mtime);
+    }
+
+    const retention = { dailyDays: 1, weeklyWeeks: 1, monthlyMonths: 1 };
+    const firstResult = await pruneOldBackups(tempDir, retention, "paperclip", now);
+    expect(firstResult.prunedCount).toBe(1);
+
+    const retainedArchives = fs.readdirSync(tempDir)
+      .filter((name) => /^paperclip-\d{8}-\d{6}\.sql\.gz$/.test(name))
+      .map((name) => path.join(tempDir, name));
+    expect(retainedArchives).toHaveLength(24);
+
+    const corruptedArchive = retainedArchives[0]!;
+    const originalStat = fs.statSync(corruptedArchive);
+    fs.writeFileSync(corruptedArchive, Buffer.alloc(originalStat.size));
+    fs.utimesSync(corruptedArchive, originalStat.atime, originalStat.mtime);
+
+    const replacementArchive = path.join(tempDir, "paperclip-20260502-010101.sql.gz");
+    fs.writeFileSync(replacementArchive, gzipSync("SELECT 'replacement';\n"));
+    const replacementMtime = new Date(now.getTime() - 59 * 86_400_000);
+    fs.utimesSync(replacementArchive, replacementMtime, replacementMtime);
+
+    const secondResult = await pruneOldBackups(tempDir, retention, "paperclip", now);
+    expect(secondResult.prunedCount).toBe(0);
+    expect(secondResult.invalidBackupFiles).toEqual([corruptedArchive]);
+
+    const validArchives = fs.readdirSync(tempDir)
+      .filter((name) => /^paperclip-\d{8}-\d{6}\.sql\.gz$/.test(name))
+      .map((name) => path.join(tempDir, name));
+    const validity = await Promise.all(validArchives.map(async (filePath) => {
+      try {
+        await verifyGzipFile(filePath);
+        return true;
+      } catch {
+        return false;
+      }
+    }));
+    expect(validity.filter(Boolean)).toHaveLength(24);
   });
 });
 

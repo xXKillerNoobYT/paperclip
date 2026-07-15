@@ -192,10 +192,11 @@ reports `database_backup_incomplete` while those files remain. Manual backups us
 
 Automatic retention validates gzip integrity before an archive is eligible for
 deletion, keeps at least 24 valid automatic backups, preserves manual/legacy and
-invalid archives, and never deletes the last valid automatic backup. Integrity
-results are cached by filename, size, and modification time in
-`data/backups/.paperclip-backup-integrity-failures.json`; the marker is updated
-atomically on each backup run. Invalid archives remain available for forensics,
+invalid archives, and never deletes the last valid automatic backup. Every
+retention pass revalidates archive content rather than trusting mutable file
+metadata. Current integrity results are recorded atomically in
+`data/backups/.paperclip-backup-integrity-failures.json` for health diagnostics.
+Invalid archives remain available for forensics,
 produce an `invalid_archive_retained` warning in the server log, and appear as
 `database_backup_invalid_archive` in `/api/health`.
 
