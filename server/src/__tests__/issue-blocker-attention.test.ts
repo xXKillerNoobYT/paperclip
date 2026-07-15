@@ -368,7 +368,49 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     ]);
   }, 15_000);
 
-  it("fails closed per root when a chain exceeds the traversal batch budget", async () => {
+  it("classifies a chain at the exact traversal depth ceiling identically for single and bulk reads", async () => {
+    const { companyId } = await createCompany("PBRC");
+    const chainRows = Array.from({ length: 513 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBRC-${index + 1}`,
+      title: index === 512 ? "Terminal human review" : `Blocked chain ${index + 1}`,
+      status: index === 512 ? "in_review" as const : "blocked" as const,
+      priority: "medium" as const,
+      assigneeUserId: index === 512 ? "board-reviewer" : null,
+      originKind: "manual",
+      originFingerprint: `root-ceiling-${index}`,
+    }));
+    await db.insert(issues).values(chainRows);
+    await db.insert(issueRelations).values(chainRows.slice(1).map((row, index) => ({
+      companyId,
+      issueId: row.id,
+      relatedIssueId: chainRows[index]!.id,
+      type: "blocks" as const,
+    })));
+
+    const root = await svc.getById(chainRows[0]!.id);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(chainRows[0]!.id);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked" }))
+      .find((issue) => issue.id === chainRows[0]!.id);
+    const relations = await svc.getRelationSummaries(chainRows[0]!.id);
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBRC-513",
+    });
+    expect(relations.blockedBy).toHaveLength(1);
+    expect(relations.blockedBy[0]?.terminalBlockers).toEqual([
+      expect.objectContaining({ id: chainRows[512]!.id, identifier: "PBRC-513" }),
+    ]);
+  }, 20_000);
+
+  it("fails closed per root when a chain exceeds the traversal depth budget", async () => {
     const { companyId } = await createCompany("PBRB");
     const chainRows = Array.from({ length: 514 }, (_, index) => ({
       id: randomUUID(),
