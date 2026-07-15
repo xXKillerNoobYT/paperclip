@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import {
   createBufferedTextFileWriter,
+  DatabaseBackupError,
   pruneOldBackups,
   publishVerifiedGzip,
   runDatabaseBackup,
@@ -293,6 +294,117 @@ describe("integrity-aware backup retention", () => {
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it(
+    "reports retained run artifacts and publishes no final when full-run publication fails",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-publication-failure-");
+      const realLinkSync = fs.linkSync;
+      const linkSpy = vi.spyOn(fs, "linkSync").mockImplementation((existingPath, newPath) => {
+        if (
+          typeof existingPath === "string"
+          && typeof newPath === "string"
+          && existingPath.startsWith(backupDir)
+          && existingPath.includes(".sql.gz.partial-")
+          && newPath.startsWith(backupDir)
+          && newPath.endsWith(".sql.gz")
+        ) {
+          throw Object.assign(new Error("simulated full-run publication failure"), { code: "EIO" });
+        }
+        return realLinkSync(existingPath, newPath);
+      });
+      syncBuiltinESMExports();
+
+      let backupError: unknown;
+      try {
+        await runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-failure-lifecycle",
+          backupEngine: "javascript",
+        });
+      } catch (error) {
+        backupError = error;
+      } finally {
+        linkSpy.mockRestore();
+        syncBuiltinESMExports();
+      }
+
+      expect(backupError).toBeInstanceOf(DatabaseBackupError);
+      const retainedArtifacts = (backupError as DatabaseBackupError).retainedArtifacts;
+      expect(retainedArtifacts).toHaveLength(2);
+      expect(retainedArtifacts.every((filePath) => fs.existsSync(filePath))).toBe(true);
+      expect(retainedArtifacts.some((filePath) => filePath.includes(".sql.gz.partial-"))).toBe(true);
+      expect(retainedArtifacts.some((filePath) => filePath.endsWith(".sql"))).toBe(true);
+      expect(
+        fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql.gz")),
+      ).toEqual([]);
+    },
+    60_000,
+  );
+
+  it(
+    "returns a valid final and diagnoses retained cleanup artifacts after full-run publication",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-cleanup-failure-");
+      const unrelatedArtifact = path.join(backupDir, "paperclip-other.sql.gz.partial-other-run");
+      const unrelatedContents = "unrelated run artifact";
+      fs.writeFileSync(unrelatedArtifact, unrelatedContents);
+      const diagnostics: Array<{
+        code: string;
+        backupFile: string;
+        retainedArtifacts?: string[];
+      }> = [];
+      const realUnlinkSync = fs.unlinkSync;
+      const unlinkSpy = vi.spyOn(fs, "unlinkSync").mockImplementation((filePath) => {
+        if (
+          typeof filePath === "string"
+          && filePath.startsWith(backupDir)
+          && filePath.includes("paperclip-cleanup-lifecycle-")
+          && filePath.includes(".sql.gz.partial-")
+          && !filePath.endsWith(".sql")
+        ) {
+          throw new Error("simulated full-run cleanup failure");
+        }
+        return realUnlinkSync(filePath);
+      });
+      syncBuiltinESMExports();
+
+      let result;
+      try {
+        result = await runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-cleanup-lifecycle",
+          backupEngine: "javascript",
+          onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+        });
+      } finally {
+        unlinkSpy.mockRestore();
+        syncBuiltinESMExports();
+      }
+
+      expect(result).toBeDefined();
+      await expect(verifyGzipFile(result!.backupFile)).resolves.toBeUndefined();
+      expect(fs.readFileSync(unrelatedArtifact, "utf8")).toBe(unrelatedContents);
+      const cleanupDiagnostic = diagnostics.find((diagnostic) => diagnostic.code === "cleanup_failed");
+      expect(cleanupDiagnostic).toMatchObject({
+        code: "cleanup_failed",
+        backupFile: result!.backupFile,
+      });
+      expect(cleanupDiagnostic?.retainedArtifacts).toHaveLength(1);
+      const retainedPath = cleanupDiagnostic?.retainedArtifacts?.[0];
+      expect(retainedPath).toContain("paperclip-cleanup-lifecycle-");
+      expect(retainedPath).toContain(".sql.gz.partial-");
+      expect(retainedPath && fs.existsSync(retainedPath)).toBe(true);
+      expect(retainedPath).not.toBe(unrelatedArtifact);
+    },
+    60_000,
+  );
+
   it(
     "backs up and restores large table payloads without materializing one giant string",
     async () => {
