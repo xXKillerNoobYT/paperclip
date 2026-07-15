@@ -325,32 +325,33 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
-  it("classifies a blocker chain beyond depth eight identically for single and bulk reads", async () => {
+  it("classifies a 300-link blocker chain identically for single and bulk reads", async () => {
     const { companyId } = await createCompany("PBDP");
-    const chainIds: string[] = [];
-    for (let index = 0; index < 12; index += 1) {
-      chainIds.push(await insertIssue({
-        companyId,
-        identifier: `PBDP-${index + 1}`,
-        title: index === 11 ? "Terminal human review" : `Blocked chain ${index + 1}`,
-        status: index === 11 ? "in_review" : "blocked",
-        assigneeUserId: index === 11 ? "board-reviewer" : null,
-      }));
-    }
-    for (let index = 0; index < chainIds.length - 1; index += 1) {
-      await block({
-        companyId,
-        blockerIssueId: chainIds[index + 1]!,
-        blockedIssueId: chainIds[index]!,
-      });
-    }
+    const chainRows = Array.from({ length: 301 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBDP-${index + 1}`,
+      title: index === 300 ? "Terminal human review" : `Blocked chain ${index + 1}`,
+      status: index === 300 ? "in_review" as const : "blocked" as const,
+      priority: "medium" as const,
+      assigneeUserId: index === 300 ? "board-reviewer" : null,
+      originKind: "manual",
+      originFingerprint: `deep-${index}`,
+    }));
+    await db.insert(issues).values(chainRows);
+    await db.insert(issueRelations).values(chainRows.slice(1).map((row, index) => ({
+      companyId,
+      issueId: row.id,
+      relatedIssueId: chainRows[index]!.id,
+      type: "blocks" as const,
+    })));
 
-    const root = await svc.getById(chainIds[0]!);
+    const root = await svc.getById(chainRows[0]!.id);
     expect(root).not.toBeNull();
-    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(chainIds[0]!);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(chainRows[0]!.id);
     const bulkRoot = (await svc.list(companyId, { status: "blocked" }))
-      .find((issue) => issue.id === chainIds[0]);
-    const relations = await svc.getRelationSummaries(chainIds[0]!);
+      .find((issue) => issue.id === chainRows[0]!.id);
+    const relations = await svc.getRelationSummaries(chainRows[0]!.id);
 
     expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
     expect(singleAttention).toMatchObject({
@@ -359,13 +360,50 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       unresolvedBlockerCount: 1,
       coveredBlockerCount: 1,
       attentionBlockerCount: 0,
-      sampleBlockerIdentifier: "PBDP-12",
+      sampleBlockerIdentifier: "PBDP-301",
     });
     expect(relations.blockedBy).toHaveLength(1);
     expect(relations.blockedBy[0]?.terminalBlockers).toEqual([
-      expect.objectContaining({ id: chainIds[11], identifier: "PBDP-12" }),
+      expect.objectContaining({ id: chainRows[300]!.id, identifier: "PBDP-301" }),
     ]);
-  });
+  }, 15_000);
+
+  it("fails closed per root when a chain exceeds the traversal batch budget", async () => {
+    const { companyId } = await createCompany("PBRB");
+    const chainRows = Array.from({ length: 514 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBRB-${index + 1}`,
+      title: index === 513 ? "Terminal human review" : `Blocked chain ${index + 1}`,
+      status: index === 513 ? "in_review" as const : "blocked" as const,
+      priority: "medium" as const,
+      assigneeUserId: index === 513 ? "board-reviewer" : null,
+      originKind: "manual",
+      originFingerprint: `root-budget-${index}`,
+    }));
+    await db.insert(issues).values(chainRows);
+    await db.insert(issueRelations).values(chainRows.slice(1).map((row, index) => ({
+      companyId,
+      issueId: row.id,
+      relatedIssueId: chainRows[index]!.id,
+      type: "blocks" as const,
+    })));
+
+    const root = await svc.getById(chainRows[0]!.id);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(chainRows[0]!.id);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked" }))
+      .find((issue) => issue.id === chainRows[0]!.id);
+    const relations = await svc.getRelationSummaries(chainRows[0]!.id);
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "needs_attention",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
+    expect(relations.blockedBy).toHaveLength(1);
+    expect(relations.blockedBy[0]?.terminalBlockers).toBeUndefined();
+  }, 20_000);
 
   it("fails closed for an explicit blocker cycle", async () => {
     const { companyId } = await createCompany("PBCY");

@@ -1630,9 +1630,10 @@ function lowTrustBoundaryIssueCondition(
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
 // One batch issues at most two parallel statements (explicit blockers + children).
-// This still covers the proven 95-link chain while bounding round trips for
-// adversarial one-node-per-level graphs.
-const BLOCKER_ATTENTION_MAX_QUERY_BATCHES = 256;
+// The shared traversal may discover a graph faster when a bulk response seeds
+// intermediate blocked roots. Classification and terminal expansion therefore
+// enforce this same limit per root so response shape cannot bypass it.
+const BLOCKER_ATTENTION_MAX_QUERY_BATCHES = 512;
 // Nodes alone do not bound a dense graph. Every query is also limited to the
 // remaining unique-edge allowance plus one sentinel row.
 const BLOCKER_ATTENTION_MAX_EDGES = 4000;
@@ -1926,12 +1927,17 @@ async function terminalExplicitBlockersByRoot(
 
   for (const rootId of rootIds) {
     const deduped = new Map<string, IssueRelationIssueSummary>();
-    const pending = [rootId];
+    const pending = [{ issueId: rootId, depth: 1 }];
     const seen = new Set<string>();
+    let rootTruncated = false;
     while (pending.length > 0) {
-      const issueId = pending.pop()!;
+      const { issueId, depth } = pending.pop()!;
       if (seen.has(issueId)) continue;
       seen.add(issueId);
+      if (depth > BLOCKER_ATTENTION_MAX_QUERY_BATCHES) {
+        rootTruncated = true;
+        break;
+      }
       const node = nodesById.get(issueId);
       if (!node || node.status === "done") continue;
       const downstreamIds = edgesByIssueId.get(issueId) ?? [];
@@ -1939,9 +1945,9 @@ async function terminalExplicitBlockersByRoot(
         if (node.id !== rootId) deduped.set(node.id, node);
         continue;
       }
-      pending.push(...downstreamIds);
+      pending.push(...downstreamIds.map((downstreamId) => ({ issueId: downstreamId, depth: depth + 1 })));
     }
-    if (deduped.size > 0) {
+    if (!rootTruncated && deduped.size > 0) {
       terminalByRoot.set(rootId, [...deduped.values()].sort((a, b) => a.title.localeCompare(b.title)));
     }
   }
@@ -2332,6 +2338,9 @@ async function listIssueBlockerAttentionMap(
   type PathClassification = {
     covered: boolean;
     stalled: boolean;
+    // Longest path represented by this memoized result, including this node.
+    // Optional only for immediate one-node classifications.
+    maxDepth?: number;
     sampleBlockerIdentifier: string | null;
     sampleStalledBlockerIdentifier: string | null;
     cycle?: boolean;
@@ -2339,6 +2348,7 @@ async function listIssueBlockerAttentionMap(
   const hardAttentionClassification = (nodeId: string, cycle = false): PathClassification => ({
     covered: false,
     stalled: false,
+    maxDepth: cycle ? Number.POSITIVE_INFINITY : 1,
     sampleBlockerIdentifier: blockerSampleIdentifier(nodesById.get(nodeId)) ?? nodeId,
     sampleStalledBlockerIdentifier: null,
     ...(cycle ? { cycle: true } : {}),
@@ -2401,11 +2411,13 @@ async function listIssueBlockerAttentionMap(
     const stalledChild = classified.find((result) => result.stalled || result.sampleStalledBlockerIdentifier);
     const sampleStalled = stalledChild?.sampleStalledBlockerIdentifier ?? null;
     const cycle = classified.some((result) => result.cycle);
+    const maxDepth = 1 + Math.max(0, ...classified.map((result) => result.maxDepth ?? 1));
     const hardAttention = classified.find((result) => !result.covered && !result.stalled);
     if (hardAttention) {
       return {
         covered: false,
         stalled: false,
+        maxDepth,
         sampleBlockerIdentifier: hardAttention.sampleBlockerIdentifier,
         sampleStalledBlockerIdentifier: sampleStalled,
         ...(cycle ? { cycle: true } : {}),
@@ -2416,6 +2428,7 @@ async function listIssueBlockerAttentionMap(
       return {
         covered: false,
         stalled: true,
+        maxDepth,
         sampleBlockerIdentifier: stalledEntry.sampleBlockerIdentifier,
         sampleStalledBlockerIdentifier: sampleStalled,
         ...(cycle ? { cycle: true } : {}),
@@ -2424,6 +2437,7 @@ async function listIssueBlockerAttentionMap(
     return {
       covered: true,
       stalled: false,
+      maxDepth,
       sampleBlockerIdentifier: classified[0]?.sampleBlockerIdentifier ?? nodeSample,
       sampleStalledBlockerIdentifier: null,
     };
@@ -2499,10 +2513,15 @@ async function listIssueBlockerAttentionMap(
       continue;
     }
 
-    const classified = topLevelEdges.map((edge) => ({
-      edge,
-      result: classifyPath(edge.blockerIssueId),
-    }));
+    const classified = topLevelEdges.map((edge) => {
+      const result = classifyPath(edge.blockerIssueId);
+      return {
+        edge,
+        result: (result.maxDepth ?? 1) > BLOCKER_ATTENTION_MAX_QUERY_BATCHES
+          ? hardAttentionClassification(edge.blockerIssueId)
+          : result,
+      };
+    });
     const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
     const attentionBlockerCount = classified.length - coveredBlockerCount - stalledBlockerCount;
