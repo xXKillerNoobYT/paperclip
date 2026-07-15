@@ -513,6 +513,51 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(relations.blockedBy[0]?.terminalBlockers).toBeUndefined();
   }, 20_000);
 
+  it("fails closed when an over-depth path rejoins a shallower shared terminal", async () => {
+    const { companyId } = await createCompany("PBSH");
+    const chainRows = Array.from({ length: 514 }, (_, index) => ({
+      id: `51300000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
+      companyId,
+      identifier: `PBSH-${index + 1}`,
+      title: index === 513 ? "Shared terminal human review" : `Blocked chain ${index + 1}`,
+      status: index === 513 ? "in_review" as const : "blocked" as const,
+      priority: "medium" as const,
+      assigneeUserId: index === 513 ? "board-reviewer" : null,
+      originKind: "manual",
+      originFingerprint: `shared-depth-${index}`,
+    }));
+    await db.insert(issues).values(chainRows);
+    await db.insert(issueRelations).values([
+      ...chainRows.slice(1).map((row, index) => ({
+        companyId,
+        issueId: row.id,
+        relatedIssueId: chainRows[index]!.id,
+        type: "blocks" as const,
+      })),
+      {
+        companyId,
+        issueId: chainRows[513]!.id,
+        relatedIssueId: chainRows[1]!.id,
+        type: "blocks" as const,
+      },
+    ]);
+
+    const root = await svc.getById(chainRows[0]!.id);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(chainRows[0]!.id);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked" }))
+      .find((issue) => issue.id === chainRows[0]!.id);
+    const relations = await svc.getRelationSummaries(chainRows[0]!.id);
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "needs_attention",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
+    expect(relations.blockedBy).toHaveLength(1);
+    expect(relations.blockedBy[0]?.terminalBlockers).toBeUndefined();
+  }, 20_000);
+
   it("fails closed for an explicit blocker cycle", async () => {
     const { companyId } = await createCompany("PBCY");
     const rootId = await insertIssue({ companyId, identifier: "PBCY-1", title: "Cycle root", status: "blocked" });

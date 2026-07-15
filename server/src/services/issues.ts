@@ -1934,13 +1934,37 @@ async function terminalExplicitBlockersByRoot(
 
   for (const rootId of rootIds) {
     const deduped = new Map<string, IssueRelationIssueSummary>();
-    const pending = [{ issueId: rootId, depth: 1 }];
-    const seen = new Set<string>();
+    const reachable = new Set<string>([rootId]);
+    const discovery = [rootId];
+    while (discovery.length > 0) {
+      const issueId = discovery.pop()!;
+      const node = nodesById.get(issueId);
+      if (!node || node.status === "done") continue;
+      for (const downstreamId of edgesByIssueId.get(issueId) ?? []) {
+        if (reachable.has(downstreamId)) continue;
+        reachable.add(downstreamId);
+        discovery.push(downstreamId);
+      }
+    }
+
+    const indegreeById = new Map([...reachable].map((issueId) => [issueId, 0]));
+    for (const issueId of reachable) {
+      for (const downstreamId of edgesByIssueId.get(issueId) ?? []) {
+        if (!reachable.has(downstreamId)) continue;
+        indegreeById.set(downstreamId, (indegreeById.get(downstreamId) ?? 0) + 1);
+      }
+    }
+
+    const pending = [...indegreeById]
+      .filter(([, indegree]) => indegree === 0)
+      .map(([issueId]) => issueId);
+    const maxDepthById = new Map<string, number>([[rootId, 1]]);
+    let processedCount = 0;
     let rootTruncated = false;
     while (pending.length > 0) {
-      const { issueId, depth } = pending.pop()!;
-      if (seen.has(issueId)) continue;
-      seen.add(issueId);
+      const issueId = pending.pop()!;
+      processedCount += 1;
+      const depth = maxDepthById.get(issueId) ?? 1;
       if (depth > BLOCKER_ATTENTION_MAX_PATH_DEPTH) {
         rootTruncated = true;
         break;
@@ -1952,8 +1976,20 @@ async function terminalExplicitBlockersByRoot(
         if (node.id !== rootId) deduped.set(node.id, node);
         continue;
       }
-      pending.push(...downstreamIds.map((downstreamId) => ({ issueId: downstreamId, depth: depth + 1 })));
+      for (const downstreamId of downstreamIds) {
+        if (!reachable.has(downstreamId)) continue;
+        maxDepthById.set(
+          downstreamId,
+          Math.max(maxDepthById.get(downstreamId) ?? 1, depth + 1),
+        );
+        const remainingIndegree = (indegreeById.get(downstreamId) ?? 1) - 1;
+        indegreeById.set(downstreamId, remainingIndegree);
+        if (remainingIndegree === 0) pending.push(downstreamId);
+      }
     }
+    // A cycle leaves at least one reachable node outside the topological order.
+    // Treat it as unknown rather than publishing a partial set of terminals.
+    if (processedCount < reachable.size) rootTruncated = true;
     if (!rootTruncated && deduped.size > 0) {
       terminalByRoot.set(rootId, [...deduped.values()].sort((a, b) => a.title.localeCompare(b.title)));
     }
