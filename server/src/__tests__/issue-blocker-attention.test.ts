@@ -393,7 +393,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(relations.blockedBy[0]?.terminalBlockers).toBeUndefined();
   });
 
-  it("keeps attention and terminal expansion fail-closed at the exact node-budget boundary", async () => {
+  it("keeps attention and terminal expansion fail-closed when a linear graph exhausts traversal work", async () => {
     const { companyId } = await createCompany("PBBG");
     const rootId = await insertIssue({ companyId, identifier: "PBBG-1", title: "Budget root", status: "blocked" });
     const blockerRows = Array.from({ length: 2000 }, (_, index) => ({
@@ -430,6 +430,101 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(relations.blockedBy).toHaveLength(1);
     expect(relations.blockedBy[0]?.terminalBlockers).toBeUndefined();
   }, 30_000);
+
+  it("bounds a wide frontier by node and edge work budgets with single/bulk parity", async () => {
+    const { companyId } = await createCompany("PBWF");
+    const rootId = await insertIssue({ companyId, identifier: "PBWF-1", title: "Wide root", status: "blocked" });
+    const blockerRows = Array.from({ length: 4001 }, (_, index) => ({
+      id: randomUUID(),
+      companyId,
+      identifier: `PBWF-${index + 2}`,
+      title: `Wide blocker ${index + 1}`,
+      status: "todo" as const,
+      priority: "medium" as const,
+      assigneeUserId: "board-reviewer",
+      originKind: "manual",
+      originFingerprint: `wide-${index}`,
+    }));
+    for (let index = 0; index < blockerRows.length; index += 500) {
+      await db.insert(issues).values(blockerRows.slice(index, index + 500));
+    }
+    const relationRows = blockerRows.map((row) => ({
+      companyId,
+      issueId: row.id,
+      relatedIssueId: rootId,
+      type: "blocks" as const,
+    }));
+    for (let index = 0; index < relationRows.length; index += 500) {
+      await db.insert(issueRelations).values(relationRows.slice(index, index + 500));
+    }
+
+    const root = await svc.getById(rootId);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(rootId);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    const relations = await svc.getRelationSummaries(rootId);
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "needs_attention",
+      unresolvedBlockerCount: 4000,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 4000,
+    });
+    expect(relations.blockedBy).toHaveLength(4001);
+    expect(relations.blockedBy.every((blocker) => blocker.terminalBlockers === undefined)).toBe(true);
+  }, 30_000);
+
+  it("classifies a shared blocker DAG once and preserves terminal agreement", async () => {
+    const { companyId } = await createCompany("PBDG");
+    const rootId = await insertIssue({ companyId, identifier: "PBDG-1", title: "DAG root", status: "blocked" });
+    const layers: string[][] = [];
+    for (let layer = 0; layer < 22; layer += 1) {
+      layers.push([
+        await insertIssue({ companyId, identifier: `PBDG-${layer * 2 + 2}`, title: `Layer ${layer} A`, status: "blocked" }),
+        await insertIssue({ companyId, identifier: `PBDG-${layer * 2 + 3}`, title: `Layer ${layer} B`, status: "blocked" }),
+      ]);
+    }
+    const terminalId = await insertIssue({
+      companyId,
+      identifier: "PBDG-46",
+      title: "Terminal human review",
+      status: "in_review",
+      assigneeUserId: "board-reviewer",
+    });
+    for (const blockerId of layers[0]!) {
+      await block({ companyId, blockerIssueId: blockerId, blockedIssueId: rootId });
+    }
+    for (let layer = 0; layer < layers.length - 1; layer += 1) {
+      for (const blockedIssueId of layers[layer]!) {
+        for (const blockerIssueId of layers[layer + 1]!) {
+          await block({ companyId, blockerIssueId, blockedIssueId });
+        }
+      }
+    }
+    for (const blockedIssueId of layers[layers.length - 1]!) {
+      await block({ companyId, blockerIssueId: terminalId, blockedIssueId });
+    }
+
+    const root = await svc.getById(rootId);
+    const singleAttention = (await svc.listBlockerAttention(companyId, [root!])).get(rootId);
+    const bulkRoot = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    const relations = await svc.getRelationSummaries(rootId);
+
+    expect(singleAttention).toEqual(bulkRoot?.blockerAttention);
+    expect(singleAttention).toMatchObject({
+      state: "covered",
+      unresolvedBlockerCount: 2,
+      coveredBlockerCount: 2,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBDG-46",
+    });
+    expect(relations.blockedBy).toHaveLength(2);
+    for (const blocker of relations.blockedBy) {
+      expect(blocker.terminalBlockers).toEqual([
+        expect.objectContaining({ id: terminalId, identifier: "PBDG-46" }),
+      ]);
+    }
+  }, 10_000);
 
   it("does not let another company's active run cover the blocker", async () => {
     const { companyId, agentId } = await createCompany("PBS");

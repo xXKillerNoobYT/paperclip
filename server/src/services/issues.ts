@@ -1629,6 +1629,13 @@ function lowTrustBoundaryIssueCondition(
 
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
+// One batch issues at most two parallel statements (explicit blockers + children).
+// This still covers the proven 95-link chain while bounding round trips for
+// adversarial one-node-per-level graphs.
+const BLOCKER_ATTENTION_MAX_QUERY_BATCHES = 256;
+// Nodes alone do not bound a dense graph. Every query is also limited to the
+// remaining unique-edge allowance plus one sentinel row.
+const BLOCKER_ATTENTION_MAX_EDGES = 4000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
 
 type IssueBlockerAttentionNode = {
@@ -1803,19 +1810,6 @@ function blockerSampleIdentifier(node: IssueBlockerAttentionNode | null | undefi
   return node?.identifier ?? node?.id ?? null;
 }
 
-function appendBlockerAttentionEdges(
-  edgesByIssueId: Map<string, IssueBlockerAttentionEdge[]>,
-  rows: IssueBlockerAttentionEdge[],
-) {
-  for (const row of rows) {
-    const existing = edgesByIssueId.get(row.issueId) ?? [];
-    if (!existing.some((edge) => edge.blockerIssueId === row.blockerIssueId)) {
-      existing.push(row);
-      edgesByIssueId.set(row.issueId, existing);
-    }
-  }
-}
-
 type IssueRelationSummaryRow = {
   relatedId: string;
   identifier: string | null;
@@ -1859,9 +1853,17 @@ async function terminalExplicitBlockersByRoot(
   const budgetNodeIds = new Set(sourceIssueIds);
   for (const rootId of rootIds) budgetNodeIds.add(rootId);
   let truncated = budgetNodeIds.size > BLOCKER_ATTENTION_MAX_NODES;
+  let queryBatchCount = 0;
+  let edgeCount = 0;
   while (frontier.length > 0 && !truncated) {
     const nextFrontier = new Set<string>();
     for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+      if (queryBatchCount >= BLOCKER_ATTENTION_MAX_QUERY_BATCHES || edgeCount >= BLOCKER_ATTENTION_MAX_EDGES) {
+        truncated = true;
+        break;
+      }
+      queryBatchCount += 1;
+      const rowLimit = BLOCKER_ATTENTION_MAX_EDGES - edgeCount + 1;
       const rows = await dbOrTx
         .select({
           currentIssueId: issueRelations.relatedIssueId,
@@ -1883,13 +1885,22 @@ async function terminalExplicitBlockersByRoot(
             eq(issues.companyId, companyId),
             ne(issues.status, "done"),
           ),
-        );
+        )
+        .orderBy(asc(issueRelations.relatedIssueId), asc(issues.id))
+        .limit(rowLimit);
+
+      if (rows.length >= rowLimit) truncated = true;
 
       for (const row of rows) {
         const existingEdges = edgesByIssueId.get(row.currentIssueId) ?? [];
         if (!existingEdges.includes(row.relatedId)) {
+          if (edgeCount >= BLOCKER_ATTENTION_MAX_EDGES) {
+            truncated = true;
+            continue;
+          }
           existingEdges.push(row.relatedId);
           edgesByIssueId.set(row.currentIssueId, existingEdges);
+          edgeCount += 1;
         }
         if (!budgetNodeIds.has(row.relatedId)) {
           if (budgetNodeIds.size >= BLOCKER_ATTENTION_MAX_NODES) {
@@ -1913,21 +1924,22 @@ async function terminalExplicitBlockersByRoot(
   // terminal expansion is safer than presenting the budget boundary as a leaf.
   if (truncated) return terminalByRoot;
 
-  const collectTerminal = (issueId: string, seen: Set<string>): IssueRelationIssueSummary[] => {
-    if (seen.has(issueId)) return [];
-    const node = nodesById.get(issueId);
-    if (!node || node.status === "done") return [];
-    const nextSeen = new Set(seen);
-    nextSeen.add(issueId);
-    const downstreamIds = edgesByIssueId.get(issueId) ?? [];
-    if (downstreamIds.length === 0) return [node];
-    return downstreamIds.flatMap((downstreamId) => collectTerminal(downstreamId, nextSeen));
-  };
-
   for (const rootId of rootIds) {
     const deduped = new Map<string, IssueRelationIssueSummary>();
-    for (const blocker of collectTerminal(rootId, new Set())) {
-      if (blocker.id !== rootId) deduped.set(blocker.id, blocker);
+    const pending = [rootId];
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const issueId = pending.pop()!;
+      if (seen.has(issueId)) continue;
+      seen.add(issueId);
+      const node = nodesById.get(issueId);
+      if (!node || node.status === "done") continue;
+      const downstreamIds = edgesByIssueId.get(issueId) ?? [];
+      if (downstreamIds.length === 0) {
+        if (node.id !== rootId) deduped.set(node.id, node);
+        continue;
+      }
+      pending.push(...downstreamIds);
     }
     if (deduped.size > 0) {
       terminalByRoot.set(rootId, [...deduped.values()].sort((a, b) => a.title.localeCompare(b.title)));
@@ -2068,10 +2080,18 @@ async function listIssueBlockerAttentionMap(
   let frontier = roots.map((root) => root.id);
   const budgetNodeIds = new Set(frontier);
   let truncated = budgetNodeIds.size > BLOCKER_ATTENTION_MAX_NODES;
+  let queryBatchCount = 0;
+  let edgeCount = 0;
   while (frontier.length > 0 && !truncated) {
     const nextFrontier = new Set<string>();
 
     for (const chunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+      if (queryBatchCount >= BLOCKER_ATTENTION_MAX_QUERY_BATCHES || edgeCount >= BLOCKER_ATTENTION_MAX_EDGES) {
+        truncated = true;
+        break;
+      }
+      queryBatchCount += 1;
+      const rowLimit = BLOCKER_ATTENTION_MAX_EDGES - edgeCount + 1;
       const explicitBlockerRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
         .select({
           issueId: issueRelations.relatedIssueId,
@@ -2096,7 +2116,9 @@ async function listIssueBlockerAttentionMap(
             eq(issues.companyId, companyId),
             ne(issues.status, "done"),
           ),
-        );
+        )
+        .orderBy(asc(issueRelations.relatedIssueId), asc(issues.id))
+        .limit(rowLimit);
       const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
         .select({
           issueId: issues.parentId,
@@ -2118,20 +2140,34 @@ async function listIssueBlockerAttentionMap(
             inArray(issues.parentId, chunk),
             notInArray(issues.status, BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES),
           ),
-        );
+        )
+        .orderBy(asc(issues.parentId), asc(issues.id))
+        .limit(rowLimit);
       const [explicitBlockerRows, childRows] = await Promise.all([
         explicitBlockerRowsPromise,
         childRowsPromise,
       ]);
 
-      appendBlockerAttentionEdges(edgesByIssueId, [
+      const candidateEdges = [
         ...explicitBlockerRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
           .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
         ...childRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
           .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
-      ]);
+      ];
+      if (explicitBlockerRows.length >= rowLimit || childRows.length >= rowLimit) truncated = true;
+      for (const edge of candidateEdges) {
+        const existing = edgesByIssueId.get(edge.issueId) ?? [];
+        if (existing.some((entry) => entry.blockerIssueId === edge.blockerIssueId)) continue;
+        if (edgeCount >= BLOCKER_ATTENTION_MAX_EDGES) {
+          truncated = true;
+          continue;
+        }
+        existing.push(edge);
+        edgesByIssueId.set(edge.issueId, existing);
+        edgeCount += 1;
+      }
 
       for (const row of [...explicitBlockerRows, ...childRows]) {
         if (!row.issueId) continue;
@@ -2298,13 +2334,21 @@ async function listIssueBlockerAttentionMap(
     stalled: boolean;
     sampleBlockerIdentifier: string | null;
     sampleStalledBlockerIdentifier: string | null;
+    cycle?: boolean;
   };
-  const classifyPath = (
-    nodeId: string,
-    seen: Set<string>,
-  ): PathClassification => {
+  const hardAttentionClassification = (nodeId: string, cycle = false): PathClassification => ({
+    covered: false,
+    stalled: false,
+    sampleBlockerIdentifier: blockerSampleIdentifier(nodesById.get(nodeId)) ?? nodeId,
+    sampleStalledBlockerIdentifier: null,
+    ...(cycle ? { cycle: true } : {}),
+  });
+  const downstreamIdsForNode = (nodeId: string) => (edgesByIssueId.get(nodeId) ?? [])
+    .filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done")
+    .map((edge) => edge.blockerIssueId);
+  const immediateClassification = (nodeId: string): PathClassification | null => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
-    if (truncated || seen.has(nodeId)) {
+    if (truncated) {
       return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null };
     }
     const node = nodesById.get(nodeId);
@@ -2338,38 +2382,7 @@ async function listIssueBlockerAttentionMap(
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
 
-    const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
-    if (downstream.length > 0) {
-      const nextSeen = new Set(seen);
-      nextSeen.add(nodeId);
-      const classified = downstream.map((edge) => classifyPath(edge.blockerIssueId, nextSeen));
-      const stalledChild = classified.find((result) => result.stalled || result.sampleStalledBlockerIdentifier);
-      const sampleStalled = stalledChild?.sampleStalledBlockerIdentifier ?? null;
-      const hardAttention = classified.find((result) => !result.covered && !result.stalled);
-      if (hardAttention) {
-        return {
-          covered: false,
-          stalled: false,
-          sampleBlockerIdentifier: hardAttention.sampleBlockerIdentifier,
-          sampleStalledBlockerIdentifier: sampleStalled,
-        };
-      }
-      const stalledEntry = classified.find((result) => result.stalled);
-      if (stalledEntry) {
-        return {
-          covered: false,
-          stalled: true,
-          sampleBlockerIdentifier: stalledEntry.sampleBlockerIdentifier,
-          sampleStalledBlockerIdentifier: sampleStalled,
-        };
-      }
-      return {
-        covered: true,
-        stalled: false,
-        sampleBlockerIdentifier: classified[0]?.sampleBlockerIdentifier ?? nodeSample,
-        sampleStalledBlockerIdentifier: null,
-      };
-    }
+    if (downstreamIdsForNode(node.id).length > 0) return null;
 
     if (node.assigneeAgentId) {
       const assignee = agentsById.get(node.assigneeAgentId);
@@ -2379,6 +2392,101 @@ async function listIssueBlockerAttentionMap(
     }
 
     return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+  };
+  const aggregateClassification = (
+    nodeId: string,
+    classified: PathClassification[],
+  ): PathClassification => {
+    const nodeSample = blockerSampleIdentifier(nodesById.get(nodeId));
+    const stalledChild = classified.find((result) => result.stalled || result.sampleStalledBlockerIdentifier);
+    const sampleStalled = stalledChild?.sampleStalledBlockerIdentifier ?? null;
+    const cycle = classified.some((result) => result.cycle);
+    const hardAttention = classified.find((result) => !result.covered && !result.stalled);
+    if (hardAttention) {
+      return {
+        covered: false,
+        stalled: false,
+        sampleBlockerIdentifier: hardAttention.sampleBlockerIdentifier,
+        sampleStalledBlockerIdentifier: sampleStalled,
+        ...(cycle ? { cycle: true } : {}),
+      };
+    }
+    const stalledEntry = classified.find((result) => result.stalled);
+    if (stalledEntry) {
+      return {
+        covered: false,
+        stalled: true,
+        sampleBlockerIdentifier: stalledEntry.sampleBlockerIdentifier,
+        sampleStalledBlockerIdentifier: sampleStalled,
+        ...(cycle ? { cycle: true } : {}),
+      };
+    }
+    return {
+      covered: true,
+      stalled: false,
+      sampleBlockerIdentifier: classified[0]?.sampleBlockerIdentifier ?? nodeSample,
+      sampleStalledBlockerIdentifier: null,
+    };
+  };
+  type ClassificationFrame = {
+    nodeId: string;
+    downstreamIds: string[];
+    nextIndex: number;
+    childResults: PathClassification[];
+  };
+  const classificationMemo = new Map<string, PathClassification>();
+  const classifyPath = (startNodeId: string): PathClassification => {
+    const cached = classificationMemo.get(startNodeId);
+    if (cached) return cached;
+    const immediate = immediateClassification(startNodeId);
+    if (immediate) {
+      classificationMemo.set(startNodeId, immediate);
+      return immediate;
+    }
+
+    const visiting = new Set<string>([startNodeId]);
+    const stack: ClassificationFrame[] = [{
+      nodeId: startNodeId,
+      downstreamIds: downstreamIdsForNode(startNodeId),
+      nextIndex: 0,
+      childResults: [],
+    }];
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!;
+      if (frame.nextIndex < frame.downstreamIds.length) {
+        const childId = frame.downstreamIds[frame.nextIndex++]!;
+        const childCached = classificationMemo.get(childId);
+        if (childCached) {
+          frame.childResults.push(childCached);
+          continue;
+        }
+        if (visiting.has(childId)) {
+          frame.childResults.push(hardAttentionClassification(childId, true));
+          continue;
+        }
+        const childImmediate = immediateClassification(childId);
+        if (childImmediate) {
+          classificationMemo.set(childId, childImmediate);
+          frame.childResults.push(childImmediate);
+          continue;
+        }
+        visiting.add(childId);
+        stack.push({
+          nodeId: childId,
+          downstreamIds: downstreamIdsForNode(childId),
+          nextIndex: 0,
+          childResults: [],
+        });
+        continue;
+      }
+
+      const result = aggregateClassification(frame.nodeId, frame.childResults);
+      classificationMemo.set(frame.nodeId, result);
+      visiting.delete(frame.nodeId);
+      stack.pop();
+      stack[stack.length - 1]?.childResults.push(result);
+    }
+    return classificationMemo.get(startNodeId) ?? hardAttentionClassification(startNodeId);
   };
 
   for (const root of roots) {
@@ -2393,7 +2501,7 @@ async function listIssueBlockerAttentionMap(
 
     const classified = topLevelEdges.map((edge) => ({
       edge,
-      result: classifyPath(edge.blockerIssueId, new Set([root.id])),
+      result: classifyPath(edge.blockerIssueId),
     }));
     const coveredBlockerCount = classified.filter((entry) => entry.result.covered).length;
     const stalledBlockerCount = classified.filter((entry) => entry.result.stalled).length;
@@ -2428,7 +2536,9 @@ async function listIssueBlockerAttentionMap(
       coveredBlockerCount,
       stalledBlockerCount,
       attentionBlockerCount,
-      sampleBlockerIdentifier: sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode),
+      sampleBlockerIdentifier: sampleEntry?.result.cycle
+        ? blockerSampleIdentifier(sampleNode)
+        : sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode),
       sampleStalledBlockerIdentifier:
         stalledEntry?.result.sampleStalledBlockerIdentifier ?? sampleStalledFromChain ?? null,
     }));
