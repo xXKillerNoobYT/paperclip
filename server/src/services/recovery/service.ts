@@ -3062,7 +3062,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
-      if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
+      const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
+      if (latestRun?.status === "succeeded" &&
+        !handoffEvidence?.exhausted &&
+        await hasPersistedDurableWaitPath(issue)) {
         result.skipped += 1;
         continue;
       }
@@ -3317,7 +3320,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
-      const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (!handoffEvidence.exhausted) {
           result.skipped += 1;
