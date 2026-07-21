@@ -1658,7 +1658,7 @@ export function issueRoutes(
       assigneeUserId: string | null;
       status: string;
     },
-    action: "issue:read" | "issue:mutate",
+    action: "issue:read" | "issue:mutate" | "issue:comment_terminal_ceo",
   ) {
     return access.decide({
       actor: req.actor,
@@ -1804,6 +1804,17 @@ export function issueRoutes(
       });
     }
     return true;
+  }
+
+  function isPlainTerminalCeoCommentRequest(req: Request, issue: { status: string }) {
+    return req.actor.type === "agent" &&
+      isClosedIssueStatus(issue.status) &&
+      req.body.authorType === undefined &&
+      req.body.presentation === undefined &&
+      req.body.metadata === undefined &&
+      req.body.reopen === undefined &&
+      req.body.resume === undefined &&
+      req.body.interrupt === undefined;
   }
 
   function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
@@ -6440,7 +6451,10 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    const terminalCeoCommentDecision = isPlainTerminalCeoCommentRequest(req, issue)
+      ? await decideIssueAccess(req, issue, "issue:comment_terminal_ceo")
+      : null;
+    if (!terminalCeoCommentDecision?.allowed && !(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,

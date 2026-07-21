@@ -69,6 +69,7 @@ async function createIssue(
   input: {
     id?: string;
     title?: string;
+    status?: "todo" | "done" | "cancelled";
     projectId?: string | null;
     parentId?: string | null;
     assigneeAgentId?: string | null;
@@ -80,7 +81,7 @@ async function createIssue(
       id: input.id ?? randomUUID(),
       companyId,
       title: input.title ?? `Issue ${randomUUID()}`,
-      status: "todo",
+      status: input.status ?? "todo",
       priority: "medium",
       projectId: input.projectId ?? null,
       parentId: input.parentId ?? null,
@@ -560,6 +561,61 @@ describeEmbeddedPostgres("authorization service", () => {
       allowed: true,
       reason: "allow_legacy_agent_creator",
     });
+  });
+
+  it("allows a same-company CEO to append a plain comment to a terminal issue with a distinct decision", async () => {
+    const company = await createCompany(db, "TerminalCeoComment");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetIssue = await createIssue(db, company.id, { assigneeAgentId: targetAgent.id, status: "done" });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:comment_terminal_ceo",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: targetIssue.id,
+        assigneeAgentId: targetAgent.id,
+        status: targetIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_terminal_ceo_comment",
+    });
+  });
+
+  it("denies terminal CEO comment authority to non-CEO, nonterminal, and cross-company actors", async () => {
+    const company = await createCompany(db, "TerminalCeoCommentDenied");
+    const otherCompany = await createCompany(db, "TerminalCeoCommentOtherCompany");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const engineer = await createAgent(db, company.id, { role: "engineer" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+    const terminalIssue = await createIssue(db, company.id, { assigneeAgentId: targetAgent.id, status: "done" });
+    const openIssue = await createIssue(db, company.id, { assigneeAgentId: targetAgent.id, status: "todo" });
+
+    const service = authorizationService(db);
+    const nonCeo = await service.decide({
+      actor: { type: "agent", agentId: engineer.id, companyId: company.id, source: "agent_key" },
+      action: "issue:comment_terminal_ceo",
+      resource: { type: "issue", companyId: company.id, issueId: terminalIssue.id, assigneeAgentId: targetAgent.id, status: terminalIssue.status },
+    });
+    const nonterminal = await service.decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:comment_terminal_ceo",
+      resource: { type: "issue", companyId: company.id, issueId: openIssue.id, assigneeAgentId: targetAgent.id, status: openIssue.status },
+    });
+    const crossCompany = await service.decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: otherCompany.id, source: "agent_key" },
+      action: "issue:comment_terminal_ceo",
+      resource: { type: "issue", companyId: company.id, issueId: terminalIssue.id, assigneeAgentId: targetAgent.id, status: terminalIssue.status },
+    });
+
+    expect(nonCeo).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    expect(nonterminal).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    expect(crossCompany).toMatchObject({ allowed: false, reason: "deny_company_boundary" });
   });
 
   it("allows scoped assignment inside a granted project and denies other projects", async () => {
