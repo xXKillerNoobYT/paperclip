@@ -3365,7 +3365,7 @@ export function issueRoutes(
       assigneeUserId: string | null;
       status: string;
     },
-    action: "issue:comment" | "issue:read" | "issue:mutate",
+    action: "issue:comment" | "issue:comment_terminal_ceo" | "issue:read" | "issue:mutate",
   ) {
     return access.decide({
       actor: req.actor,
@@ -3395,6 +3395,17 @@ export function issueRoutes(
     if (decision.allowed) return true;
     res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
     return false;
+  }
+
+  function isPlainTerminalCeoCommentRequest(req: Request, issue: { status: string }) {
+    return req.actor.type === "agent" &&
+      isClosedIssueStatus(issue.status) &&
+      req.body.authorType === undefined &&
+      req.body.presentation === undefined &&
+      req.body.metadata === undefined &&
+      req.body.reopen === undefined &&
+      req.body.resume === undefined &&
+      req.body.interrupt === undefined;
   }
 
   async function assertAgentIssueCommentAllowed(
@@ -9459,7 +9470,12 @@ export function issueRoutes(
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
+    const terminalCeoCommentDecision = isPlainTerminalCeoCommentRequest(req, issue)
+      ? await decideIssueAccess(req, issue, "issue:comment_terminal_ceo")
+      : null;
+    const commentAccessDecision = terminalCeoCommentDecision?.allowed
+      ? terminalCeoCommentDecision
+      : await assertAgentIssueCommentAllowed(req, res, issue);
     if (!commentAccessDecision) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
@@ -9477,6 +9493,7 @@ export function issueRoutes(
     const interruptRequested = req.body.interrupt === true;
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
+    const terminalCeoCommentOnly = terminalCeoCommentDecision?.allowed === true;
     const mentionGrantedPeerAgentCommentOnly =
       isClosed &&
       req.actor.type === "agent" &&
@@ -9484,6 +9501,7 @@ export function issueRoutes(
       issue.assigneeAgentId !== req.actor.agentId &&
       !reopenRequested &&
       !resumeRequested &&
+      !terminalCeoCommentOnly &&
       isIssueMentionGrantDecision(commentAccessDecision);
     const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
     const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
@@ -9492,6 +9510,7 @@ export function issueRoutes(
       req.actor.type === "agent" &&
       issue.assigneeAgentId !== null &&
       issue.assigneeAgentId !== req.actor.agentId &&
+      !terminalCeoCommentOnly &&
       !mentionGrantedPeerAgentCommentOnly
     ) {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;

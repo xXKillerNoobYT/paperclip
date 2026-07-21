@@ -334,7 +334,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockAccessService.canUser.mockResolvedValue(false);
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => {
-      const allowed = input.action !== "tasks:manage_active_checkouts";
+      const allowed = input.action !== "tasks:manage_active_checkouts" && input.action !== "issue:comment_terminal_ceo";
       return {
         allowed,
         action: input.action,
@@ -535,6 +535,59 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
     ));
+  });
+
+  it("allows a same-company CEO to append a plain comment to another agent's terminal issue without mutating it", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "issue:read" || input.action === "issue:comment_terminal_ceo",
+      action: input.action,
+      reason: input.action === "issue:comment_terminal_ceo" ? "allow_terminal_ceo_comment" : "deny_missing_grant",
+      explanation: "Test authorization decision.",
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      ...agentActor("33333333-3333-4333-8333-333333333333"),
+      runId: "77777777-7777-4777-8777-777777777777",
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Closeout evidence." });
+
+    expect(res.status).toBe(201);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment_terminal_ceo" }));
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issue.id,
+      "Closeout evidence.",
+      expect.objectContaining({ agentId: "33333333-3333-4333-8333-333333333333" }),
+      expect.anything(),
+    );
+  });
+
+  it.each(["resume", "reopen"] as const)("does not use terminal CEO comment authority for %s attempts", async (intent) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "issue:read" || input.action === "issue:comment" || input.action === "issue:mutate",
+      action: input.action,
+      reason: input.action === "issue:mutate" ? "allow_legacy_agent_creator" : "deny_missing_grant",
+      explanation: "Test authorization decision.",
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      ...agentActor("33333333-3333-4333-8333-333333333333"),
+      runId: "77777777-7777-4777-8777-777777777777",
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Reopen another agent's work.", [intent]: true });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment_terminal_ceo" }));
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
   it("rejects non-assignee agent POST comments on closed issues", async () => {
