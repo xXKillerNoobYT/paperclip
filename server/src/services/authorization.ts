@@ -941,7 +941,8 @@ export function authorizationService(db: Db) {
         return lowTrustAllow("Allowed inside the low-trust issue boundary.");
       }
       if (
-        input.action === "issue:comment" &&
+        input.action !== "issue:mutate" &&
+        input.action !== "issue:comment_terminal_ceo" &&
         input.resource.issueId &&
         await agentHasMentionGrantOnIssue({
           action: input.action,
