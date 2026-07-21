@@ -2828,8 +2828,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    // A missing-disposition handoff has a source-scoped recovery action and an
+    // owner wake, but no dependency edge. Keep it actionable in that narrow
+    // case instead of parking it in blocked with an empty blocker set.
+    const nextStatus = blockerIds.length > 0
+      ? "blocked"
+      : recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+        ? "todo"
+        : "blocked";
     const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
+      status: nextStatus,
       blockedByIssueIds: blockerIds,
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
     });
@@ -2920,7 +2928,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
+        status: nextStatus,
         previousStatus: input.previousStatus,
         source: input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "recovery.reconcile_successful_run_handoff_missing_state"
@@ -2961,11 +2969,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .limit(1);
       if (
         currentIssue &&
-        (currentIssue.status !== "blocked" ||
+        (currentIssue.status !== nextStatus ||
           currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
       ) {
         const reblocked = await issuesSvc.update(input.issue.id, {
-          status: "blocked",
+          status: nextStatus,
           blockedByIssueIds: blockerIds,
           assigneeAgentId: recoveryAction.ownerAgentId,
         });
@@ -3054,7 +3062,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
-      if (latestRun?.status === "succeeded" && await hasPersistedDurableWaitPath(issue)) {
+      const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
+      if (latestRun?.status === "succeeded" &&
+        !handoffEvidence?.exhausted &&
+        await hasPersistedDurableWaitPath(issue)) {
         result.skipped += 1;
         continue;
       }
@@ -3309,7 +3320,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
-      const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (!handoffEvidence.exhausted) {
           result.skipped += 1;
