@@ -62,6 +62,7 @@ export type AuthorizationAction =
   | "agent:wake"
   | "company_scope:read"
   | "issue:comment"
+  | "issue:comment_terminal_ceo"
   | "issue:mutate"
   | "issue:read"
   | "project:read"
@@ -102,6 +103,7 @@ export type AuthorizationDecision = {
     | "allow_self"
     | "allow_company_agent"
     | "allow_company_member"
+    | "allow_terminal_ceo_comment"
     | "allow_simple_company_member"
     | "allow_manager_chain"
     | "deny_unauthenticated"
@@ -145,7 +147,11 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
   ) {
     return null;
   }
-  if (action === "issue:comment" || action === "issue:mutate") return null;
+  if (
+    action === "issue:comment" ||
+    action === "issue:comment_terminal_ceo" ||
+    action === "issue:mutate"
+  ) return null;
   return action;
 }
 
@@ -922,7 +928,12 @@ export function authorizationService(db: Db) {
         : lowTrustDeny("Project is outside this low-trust boundary.");
     }
 
-    if (input.action === "issue:comment" || input.action === "issue:read" || input.action === "issue:mutate") {
+    if (
+      input.action === "issue:comment" ||
+      input.action === "issue:comment_terminal_ceo" ||
+      input.action === "issue:read" ||
+      input.action === "issue:mutate"
+    ) {
       if (input.resource.type !== "issue") {
         return lowTrustDeny("Low-trust issue access is missing an issue resource.");
       }
@@ -930,7 +941,7 @@ export function authorizationService(db: Db) {
         return lowTrustAllow("Allowed inside the low-trust issue boundary.");
       }
       if (
-        input.action !== "issue:mutate" &&
+        input.action === "issue:comment" &&
         input.resource.issueId &&
         await agentHasMentionGrantOnIssue({
           action: input.action,
@@ -1724,6 +1735,17 @@ export function authorizationService(db: Db) {
         reason: "allow_simple_company_member",
         explanation: "Allowed by simple mode company-wide task assignment default.",
       });
+    }
+
+    if (input.action === "issue:comment_terminal_ceo") {
+      const resource = input.resource.type === "issue" ? input.resource : null;
+      if (actorAgent.role === "ceo" && (resource?.status === "done" || resource?.status === "cancelled")) {
+        return allow({
+          action: input.action,
+          reason: "allow_terminal_ceo_comment",
+          explanation: "Allowed for a same-company CEO to append a plain comment to a terminal issue.",
+        });
+      }
     }
 
     if (input.action === "issue:comment" || input.action === "issue:mutate") {
