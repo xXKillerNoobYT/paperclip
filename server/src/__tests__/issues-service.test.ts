@@ -3376,6 +3376,51 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(blockedRelations.blockedBy.map((relation) => relation.id)).toEqual([blockerId]);
   });
 
+  it("atomically removes terminal blockers and reads back only requested live blockers", async () => {
+    const companyId = randomUUID();
+    const doneBlockerId = randomUUID();
+    const cancelledBlockerId = randomUUID();
+    const liveBlockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: doneBlockerId, companyId, title: "Done blocker", status: "done", priority: "medium" },
+      { id: cancelledBlockerId, companyId, title: "Cancelled blocker", status: "cancelled", priority: "medium" },
+      { id: liveBlockerId, companyId, title: "Live blocker", status: "todo", priority: "medium" },
+      { id: blockedId, companyId, title: "Blocked issue", status: "blocked", priority: "medium" },
+    ]);
+
+    await svc.update(blockedId, {
+      blockedByIssueIds: [doneBlockerId, cancelledBlockerId, liveBlockerId],
+    });
+
+    expect((await svc.getRelationSummaries(blockedId)).blockedBy.map((relation) => relation.id)).toEqual([liveBlockerId]);
+  });
+
+  it("rejects generic blocker links in either parent-child orientation", async () => {
+    const companyId = randomUUID();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Parent", status: "todo", priority: "medium" },
+      { id: childId, companyId, parentId, title: "Child", status: "todo", priority: "medium" },
+    ]);
+
+    await expect(svc.update(parentId, { blockedByIssueIds: [childId] })).rejects.toMatchObject({ status: 422 });
+    await expect(svc.update(childId, { blockedByIssueIds: [parentId] })).rejects.toMatchObject({ status: 422 });
+  });
+
   it("returns blocked-by summaries on newly created issues", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
