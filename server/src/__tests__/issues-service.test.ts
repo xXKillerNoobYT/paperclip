@@ -3602,6 +3602,109 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ]);
   });
 
+  it("treats done and cancelled issue blockers as terminal without promoting an explicit review gate", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+    const reviewStageId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "reviewer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    const doneBlockerId = randomUUID();
+    const cancelledBlockerId = randomUUID();
+    const activeBlockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: doneBlockerId, companyId, title: "Done blocker", status: "done", priority: "medium" },
+      { id: cancelledBlockerId, companyId, title: "Cancelled blocker", status: "cancelled", priority: "medium" },
+      { id: activeBlockerId, companyId, title: "Active blocker", status: "todo", priority: "medium" },
+      {
+        id: dependentId,
+        companyId,
+        title: "Dependent awaiting review",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId,
+        executionPolicy: {
+          stages: [{ id: reviewStageId, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId },
+          returnAssignee: { type: "agent", agentId: assigneeAgentId },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+    ]);
+
+    await svc.update(dependentId, { blockedByIssueIds: [doneBlockerId, cancelledBlockerId] });
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+    await expect(svc.listWakeableBlockedDependents(cancelledBlockerId)).resolves.toEqual([
+      expect.objectContaining({ id: dependentId, assigneeAgentId }),
+    ]);
+
+    // Dependency readiness can trigger a wake, but must not clear a distinct review gate.
+    await expect(svc.getById(dependentId)).resolves.toMatchObject({
+      status: "blocked",
+      executionState: expect.objectContaining({ currentStageId: reviewStageId }),
+    });
+
+    await svc.update(dependentId, { blockedByIssueIds: [cancelledBlockerId, activeBlockerId] });
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [activeBlockerId],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+
+    await svc.update(activeBlockerId, { status: "done" });
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+  });
+
   it("treats done blockers on a shared workspace as ready while a foreign issue is in-flight", async () => {
     const {
       companyId,

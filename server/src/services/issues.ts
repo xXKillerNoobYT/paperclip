@@ -104,6 +104,7 @@ import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recover
 import { visibleIssueCondition } from "./issue-visibility.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
@@ -154,6 +155,10 @@ function assertTransition(from: string, to: string) {
   if (!ALL_ISSUE_STATUSES.includes(to)) {
     throw conflict(`Unknown issue status: ${to}`);
   }
+}
+
+function isTerminalIssueStatus(status: string) {
+  return TERMINAL_ISSUE_STATUSES.includes(status);
 }
 
 function applyStatusSideEffects(
@@ -1093,9 +1098,9 @@ async function listIssueDependencyReadinessMap(
       ),
     );
 
-  // Collect issue/workspace pairs of "done" blockers — these are the only ones
-  // subject to the workspace-finalize barrier. Blockers that aren't done already
-  // mark the dependent as not-ready and don't need a finalize check.
+  // Collect issue/workspace pairs of "done" blockers — these are the only terminal
+  // blockers subject to the workspace-finalize barrier. Cancelled blockers are
+  // terminal too, but never represent completed workspace output to finalize.
   const doneBlockerWorkspacePairs: Array<{ blockerIssueId: string; executionWorkspaceId: string }> = [];
   for (const row of blockerRows) {
     if (row.blockerStatus === "done" && row.blockerExecutionWorkspaceId) {
@@ -1114,9 +1119,9 @@ async function listIssueDependencyReadinessMap(
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
-    if (row.blockerStatus !== "done") {
+    // First-class issue blockers resolve once terminal. External gates are not
+    // represented by issue relations and remain governed by their own policies.
+    if (row.blockerStatus !== "done" && row.blockerStatus !== "cancelled") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
@@ -1157,8 +1162,7 @@ async function listUnresolvedBlockerIssueIds(
       and(
         eq(issues.companyId, companyId),
         inArray(issues.id, uniqueBlockerIssueIds),
-        // Cancelled blockers intentionally remain unresolved until the relation changes.
-        ne(issues.status, "done"),
+        notInArray(issues.status, ["done", "cancelled"]),
       ),
     )
     .then((rows) => rows.map((row) => row.id));
@@ -1875,7 +1879,7 @@ async function terminalExplicitBlockersByRoot(
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, chunk),
             eq(issues.companyId, companyId),
-            ne(issues.status, "done"),
+            notInArray(issues.status, TERMINAL_ISSUE_STATUSES),
           ),
         );
 
@@ -1899,7 +1903,7 @@ async function terminalExplicitBlockersByRoot(
   const collectTerminal = (issueId: string, seen: Set<string>): IssueRelationIssueSummary[] => {
     if (seen.has(issueId)) return [];
     const node = nodesById.get(issueId);
-    if (!node || node.status === "done") return [];
+    if (!node || isTerminalIssueStatus(node.status)) return [];
     const nextSeen = new Set(seen);
     nextSeen.add(issueId);
     const downstreamIds = edgesByIssueId.get(issueId) ?? [];
@@ -2076,7 +2080,7 @@ async function listIssueBlockerAttentionMap(
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, chunk),
             eq(issues.companyId, companyId),
-            ne(issues.status, "done"),
+            notInArray(issues.status, TERMINAL_ISSUE_STATUSES),
           ),
         );
       const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
@@ -2190,7 +2194,7 @@ async function listIssueBlockerAttentionMap(
   }
 
   const explicitWaitCandidateIds = [...nodesById.values()]
-    .filter((node) => node.status !== "done")
+    .filter((node) => !isTerminalIssueStatus(node.status))
     .map((node) => node.id);
   const explicitWaitingIssueIds = new Set<string>();
   if (explicitWaitCandidateIds.length > 0) {
@@ -2287,7 +2291,7 @@ async function listIssueBlockerAttentionMap(
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeId, sampleStalledBlockerIdentifier: null };
     }
     const nodeSample = blockerSampleIdentifier(node);
-    if (node.status === "done") {
+    if (isTerminalIssueStatus(node.status)) {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (explicitWaitingIssueIds.has(node.id)) {
@@ -2306,14 +2310,13 @@ async function listIssueBlockerAttentionMap(
     if (activeIssueIds.has(node.id)) {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
-    if (node.status === "cancelled") {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
-    }
     if (node.status === "backlog" && node.assigneeAgentId) {
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
 
-    const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
+    const downstream = (edgesByIssueId.get(node.id) ?? []).filter(
+      (edge) => !isTerminalIssueStatus(nodesById.get(edge.blockerIssueId)?.status ?? ""),
+    );
     if (downstream.length > 0) {
       const nextSeen = new Set(seen);
       nextSeen.add(nodeId);
@@ -2357,7 +2360,9 @@ async function listIssueBlockerAttentionMap(
   };
 
   for (const root of roots) {
-    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
+    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter(
+      (edge) => !isTerminalIssueStatus(nodesById.get(edge.blockerIssueId)?.status ?? ""),
+    );
     if (topLevelEdges.length === 0) {
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",

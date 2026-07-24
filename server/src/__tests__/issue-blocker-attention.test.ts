@@ -298,6 +298,70 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(parent?.blockerAttention?.sampleBlockerIdentifier).not.toBe("PBD-4");
   });
 
+  it("ignores done and cancelled explicit blockers when calculating blocker attention", async () => {
+    const { companyId } = await createCompany("PBT");
+    const parentId = await insertIssue({ companyId, identifier: "PBT-1", title: "Parent", status: "blocked" });
+    const doneBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBT-2",
+      title: "Done blocker",
+      status: "done",
+    });
+    const cancelledBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBT-3",
+      title: "Cancelled blocker",
+      status: "cancelled",
+    });
+    await block({ companyId, blockerIssueId: doneBlockerId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: cancelledBlockerId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 0,
+      coveredBlockerCount: 0,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: null,
+    });
+  });
+
+  it("keeps an active explicit blocker as the only attention path beside a cancelled blocker", async () => {
+    const { companyId, agentId } = await createCompany("PBE");
+    const parentId = await insertIssue({ companyId, identifier: "PBE-1", title: "Parent", status: "blocked" });
+    const cancelledBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBE-2",
+      title: "Cancelled blocker",
+      status: "cancelled",
+    });
+    const activeBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBE-3",
+      title: "Running blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: cancelledBlockerId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: activeBlockerId, blockedIssueId: parentId });
+    await activeRun({ companyId, agentId, issueId: activeBlockerId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBE-3",
+    });
+  });
+
   it("covers recursive blocker chains when the downstream leaf has active work", async () => {
     const { companyId, agentId } = await createCompany("PBR");
     const parentId = await insertIssue({ companyId, identifier: "PBR-1", title: "Parent", status: "blocked" });
@@ -447,7 +511,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
-  it("prefers needs_attention over stalled when the chain also has a hard attention case", async () => {
+  it("keeps an explicit review gate stalled when a terminal blocker is also linked", async () => {
     const { companyId, agentId } = await createCompany("PBQ");
     const parentId = await insertIssue({ companyId, identifier: "PBQ-1", title: "Parent", status: "blocked" });
     const reviewLeafId = await insertIssue({
@@ -470,11 +534,11 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
 
     expect(parent?.blockerAttention).toMatchObject({
-      state: "needs_attention",
-      reason: "attention_required",
+      state: "stalled",
+      reason: "stalled_review",
       coveredBlockerCount: 0,
       stalledBlockerCount: 1,
-      attentionBlockerCount: 1,
+      attentionBlockerCount: 0,
       sampleStalledBlockerIdentifier: "PBQ-2",
     });
   });
@@ -519,8 +583,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(parent?.blockerAttention).toMatchObject({
       state: "covered",
       reason: "active_dependency",
-      unresolvedBlockerCount: 2,
-      coveredBlockerCount: 2,
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
       attentionBlockerCount: 0,
     });
   });
