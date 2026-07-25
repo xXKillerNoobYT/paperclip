@@ -96,6 +96,37 @@ describe("successful run handoff decision", () => {
     expect(decision.instruction).toContain("record an explicit continuation path");
   });
 
+  it("does not hand off an authorized manual force-fresh probe after its terminal probe disposition", () => {
+    expect(decide({
+      run: {
+        ...run,
+        invocationSource: "on_demand",
+        triggerDetail: "manual",
+        contextSnapshot: {
+          issueId: "issue-1",
+          wakeSource: "on_demand",
+          forceFreshSession: true,
+        },
+      } as any,
+    })).toEqual({
+      kind: "skip",
+      reason: "authorized manual force-fresh probe owns its terminal disposition",
+    });
+
+    expect(decide({
+      run: {
+        ...run,
+        invocationSource: "on_demand",
+        triggerDetail: "manual",
+        contextSnapshot: {
+          issueId: "issue-1",
+          wakeSource: "on_demand",
+          forceFreshSession: false,
+        },
+      } as any,
+    })).toMatchObject({ kind: "enqueue" });
+  });
+
   it("does not queue when the issue already has a valid disposition", () => {
     expect(decide({ issue: { ...issue, status: "done" } as any })).toEqual({
       kind: "skip",

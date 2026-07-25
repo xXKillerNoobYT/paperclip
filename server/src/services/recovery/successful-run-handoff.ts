@@ -288,6 +288,14 @@ function isCorrectiveHandoffRun(run: HeartbeatRunRow) {
     readString(context.wakeReason) === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON;
 }
 
+function isAuthorizedManualForceFreshProbe(run: HeartbeatRunRow) {
+  const context = readRecord(run.contextSnapshot);
+  return run.invocationSource === "on_demand" &&
+    run.triggerDetail === "manual" &&
+    readString(context.wakeSource) === "on_demand" &&
+    context.forceFreshSession === true;
+}
+
 function isIssueMonitorMaintenanceRun(run: HeartbeatRunRow) {
   const context = readRecord(run.contextSnapshot);
   const wakeReason = readString(context.wakeReason);
@@ -359,6 +367,9 @@ export function decideSuccessfulRunHandoff(input: {
 
   if (run.status !== "succeeded") return { kind: "skip", reason: "source run did not succeed" };
   if (isCorrectiveHandoffRun(run)) return { kind: "skip", reason: "source run is already a corrective handoff run" };
+  if (isAuthorizedManualForceFreshProbe(run)) {
+    return { kind: "skip", reason: "authorized manual force-fresh probe owns its terminal disposition" };
+  }
   if (isIssueMonitorMaintenanceRun(run)) return { kind: "skip", reason: "issue monitor run owns its own recovery path" };
   if (isCommentDrivenWake(run)) return { kind: "skip", reason: "comment-driven wake already owns the next action" };
   if (run.issueCommentStatus === "retry_queued" || run.issueCommentStatus === "retry_exhausted") {
