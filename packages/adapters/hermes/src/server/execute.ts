@@ -514,6 +514,10 @@ export async function execute(
       `[hermes] Resuming session: ${prevSessionId}\n`,
     );
   }
+  await ctx.onLog(
+    "stdout",
+    `[hermes] Resolved execution workspace: cwd=${cwd}, source=${workspaceSource || "configured"}, repo=${workspaceRepoUrl || "unknown"}\n`,
+  );
 
   // ── Execute ────────────────────────────────────────────────────────────
   // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).

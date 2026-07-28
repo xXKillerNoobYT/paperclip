@@ -70,7 +70,7 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
         wakeReason: "manual",
         paperclipWake: null,
       },
-      onLog: vi.fn(async () => undefined),
+      onLog: vi.fn(async (_stream: "stdout" | "stderr", _message: string) => undefined),
       onMeta: vi.fn(async () => undefined),
       onSpawn,
     } satisfies Record<string, unknown>,
@@ -124,6 +124,16 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     expect((opts.env as Record<string, string>).PAPERCLIP_WORKSPACE_REPO_URL).toBe(
       "https://github.com/SkyyPlayz/Questing",
     );
+    const onLogCalls = vi.mocked(ctx.onLog).mock.calls;
+    expect(
+      onLogCalls.some(
+        ([stream, message]) =>
+          stream === "stdout" &&
+          String(message).includes(
+            `Resolved execution workspace: cwd=${questingWorktree}, source=task_session, repo=https://github.com/SkyyPlayz/Questing`,
+          ),
+      ),
+    ).toBe(true);
   });
 
   it("runChildProcess opts type includes onSpawn", () => {
