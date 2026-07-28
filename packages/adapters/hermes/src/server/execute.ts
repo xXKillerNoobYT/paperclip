@@ -467,6 +467,13 @@ export async function execute(
 
   // BUG FIX: Read task context from ctx.context (wake context), not ctx.config (adapter config)
   const ctxContext = (ctx as any).context || {};
+  const workspaceContext =
+    ctxContext.paperclipWorkspace && typeof ctxContext.paperclipWorkspace === "object"
+      ? ctxContext.paperclipWorkspace as Record<string, unknown>
+      : {};
+  const workspaceCwd = cfgString(workspaceContext.cwd);
+  const workspaceRepoUrl = cfgString(workspaceContext.repoUrl);
+  const workspaceSource = cfgString(workspaceContext.source);
   const envTaskId = cfgString(ctxContext.taskId) || cfgString(ctxContext.issueId) || cfgString(ctx.config?.taskId);
   if (envTaskId) env.PAPERCLIP_TASK_ID = envTaskId;
   const envWakeReason = cfgString(ctxContext.wakeReason) || cfgString(ctx.config?.wakeReason);
@@ -475,10 +482,21 @@ export async function execute(
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
   const wakePayloadJson = stringifyPaperclipWakePayload(ctxContext.paperclipWake);
   if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  if (workspaceCwd) env.PAPERCLIP_WORKSPACE_CWD = workspaceCwd;
+  if (workspaceRepoUrl) env.PAPERCLIP_WORKSPACE_REPO_URL = workspaceRepoUrl;
 
   // ── Resolve working directory ──────────────────────────────────────────
+  // Paperclip realizes isolated execution workspaces in the wake context. The
+  // adapter must prefer that realized path over its static configured fallback;
+  // otherwise the child process inherits the server/harness cwd and can run in
+  // a different project's checkout.
+  const configuredCwd = cfgString(config.cwd);
+  const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && Boolean(configuredCwd);
   const cwd =
-    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+    (!useConfiguredInsteadOfAgentHome ? workspaceCwd : undefined) ||
+    configuredCwd ||
+    cfgString(ctx.config?.workspaceDir) ||
+    ".";
   try {
     await ensureAbsoluteDirectory(cwd);
   } catch {

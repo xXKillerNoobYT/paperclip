@@ -104,6 +104,28 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     expect(opts.onSpawn).toBe(onSpawn);
   });
 
+  it("runs in the realized execution workspace instead of the configured fallback checkout", async () => {
+    const { ctx } = makeCtx();
+    const questingWorktree = "/Users/IA/GitHub/Questing/.paperclip/worktrees/WEI-6460";
+    (ctx.agent.adapterConfig as Record<string, unknown>).cwd = "/Users/IA/GitHub/Weird-Part-Run-2";
+    (ctx.context as Record<string, unknown>).paperclipWorkspace = {
+      cwd: questingWorktree,
+      source: "task_session",
+      repoUrl: "https://github.com/SkyyPlayz/Questing",
+    };
+
+    await execute(ctx as any);
+
+    const mocked = vi.mocked(serverUtils.runChildProcess);
+    const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
+    const opts = lastCall[3] as Record<string, unknown>;
+    expect(opts.cwd).toBe(questingWorktree);
+    expect((opts.env as Record<string, string>).PAPERCLIP_WORKSPACE_CWD).toBe(questingWorktree);
+    expect((opts.env as Record<string, string>).PAPERCLIP_WORKSPACE_REPO_URL).toBe(
+      "https://github.com/SkyyPlayz/Questing",
+    );
+  });
+
   it("runChildProcess opts type includes onSpawn", () => {
     // Type-level assertion: if onSpawn were removed from the type,
     // this file would fail to compile. The runtime test above catches
