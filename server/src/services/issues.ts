@@ -4280,11 +4280,9 @@ export function issueService(db: Db) {
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
     dbOrTx: any = db,
+    options: { allowDirectChildBlocker?: boolean } = {},
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
-    if (deduped.some((candidate) => candidate === issueId)) {
-      throw unprocessable("Issue cannot be blocked by itself");
-    }
 
     if (deduped.length > 0) {
       const lockedIssueIds = [issueId, ...deduped].sort();
@@ -4294,12 +4292,58 @@ export function issueService(db: Db) {
             ORDER BY ${issues.id}
             FOR UPDATE`,
       );
-      const relatedIssues = await dbOrTx
-        .select({ id: issues.id })
-        .from(issues)
-        .where(and(eq(issues.companyId, companyId), inArray(issues.id, deduped)));
+      const [relatedIssues, hierarchyIssues] = await Promise.all([
+        dbOrTx
+          .select({ id: issues.id, status: issues.status })
+          .from(issues)
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, deduped))),
+        dbOrTx
+          .select({ id: issues.id, parentId: issues.parentId })
+          .from(issues)
+          .where(eq(issues.companyId, companyId)),
+      ]);
       if (relatedIssues.length !== deduped.length) {
         throw unprocessable("Blocked-by issues must belong to the same company");
+      }
+
+      const typedRelatedIssues = relatedIssues as Array<{ id: string; status: string }>;
+      const typedHierarchyIssues = hierarchyIssues as Array<{ id: string; parentId: string | null }>;
+      const parentIdByIssueId = new Map<string, string | null>(typedHierarchyIssues.map((row) => [row.id, row.parentId]));
+      const relatedIssueById = new Map<string, { id: string; status: string }>(typedRelatedIssues.map((row) => [row.id, row]));
+      const relationError = (reason: "self" | "ancestor" | "descendant" | "done" | "cancelled", blockerIssueId: string) =>
+        unprocessable(
+          reason === "self"
+            ? "Issue cannot be blocked by itself"
+            : reason === "ancestor"
+              ? "Issue cannot be blocked by an ancestor"
+              : reason === "descendant"
+                ? "Issue cannot be blocked by a descendant"
+                : `Issue cannot be blocked by a ${reason} issue`,
+          { code: "invalid_blocker_relation", reason, issueId, blockerIssueId },
+        );
+
+      for (const blockerIssueId of deduped) {
+        if (blockerIssueId === issueId) throw relationError("self", blockerIssueId);
+        const blocker = relatedIssueById.get(blockerIssueId)!;
+        if (blocker.status === "done" || blocker.status === "cancelled") {
+          throw relationError(blocker.status, blockerIssueId);
+        }
+
+        const issueAncestors = new Set<string>();
+        for (let currentId: string | null | undefined = parentIdByIssueId.get(issueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
+          if (issueAncestors.has(currentId)) break;
+          issueAncestors.add(currentId);
+          if (currentId === blockerIssueId) throw relationError("ancestor", blockerIssueId);
+        }
+
+        const blockerAncestors = new Set<string>();
+        for (let currentId: string | null | undefined = parentIdByIssueId.get(blockerIssueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
+          if (blockerAncestors.has(currentId)) break;
+          blockerAncestors.add(currentId);
+          if (currentId === issueId && !(options.allowDirectChildBlocker && parentIdByIssueId.get(blockerIssueId) === issueId)) {
+            throw relationError("descendant", blockerIssueId);
+          }
+        }
       }
       await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
     }
@@ -5687,6 +5731,8 @@ export function issueService(db: Db) {
           parent.companyId,
           [...new Set([...existingBlockers.map((row) => row.blockerIssueId), child.id])],
           { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+          db,
+          { allowDirectChildBlocker: true },
         );
         [child] = await withIssueRelationSummaries(parent.companyId, [child], db);
       }
