@@ -406,7 +406,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
   );
 
   it(
-    "backs up and restores large table payloads without materializing one giant string",
+    "restores large COPY payloads through the no-psql incremental stream",
     async () => {
       const sourceConnectionString = await createTempDatabase();
       const restoreConnectionString = await createSiblingDatabase(
@@ -416,6 +416,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       const backupDir = createTempDir("paperclip-db-backup-output-");
       const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
       const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const originalPsqlPath = process.env.PAPERCLIP_PSQL_PATH;
 
       try {
         await sourceSql.unsafe(`
@@ -465,6 +466,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         expect(result.sizeBytes).toBeGreaterThan(0);
         expect(fs.existsSync(result.backupFile)).toBe(true);
 
+        process.env.PAPERCLIP_PSQL_PATH = "/bin/false";
         await runDatabaseRestore({
           connectionString: restoreConnectionString,
           backupFile: result.backupFile,
@@ -505,6 +507,11 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
           },
         ]);
       } finally {
+        if (originalPsqlPath === undefined) {
+          delete process.env.PAPERCLIP_PSQL_PATH;
+        } else {
+          process.env.PAPERCLIP_PSQL_PATH = originalPsqlPath;
+        }
         await sourceSql.end();
         await restoreSql.end();
       }

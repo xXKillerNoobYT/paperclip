@@ -533,7 +533,7 @@ async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
 
 type RestoreStatement =
   | { kind: "sql"; statement: string }
-  | { kind: "copy"; statement: string; data: string };
+  | { kind: "copy"; statement: string; data: AsyncIterable<string> };
 
 async function* readRestoreStatements(backupFile: string): AsyncGenerator<RestoreStatement> {
   const raw = createReadStream(backupFile);
@@ -561,18 +561,17 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<Restor
         continue;
       }
       if (/^COPY\s+.+\s+FROM\s+stdin;$/i.test(line)) {
-        const copyLines: string[] = [];
-        for await (const copyLine of reader) {
-          if (copyLine === "\\.") break;
-          copyLines.push(copyLine);
+        // Keep the readline source live while postgres.js consumes COPY rows. A
+        // complete table must never be materialized in memory before writable()
+        // starts applying backpressure. The psql-only `\\.` terminator is not
+        // sent to postgres.js; ending this iterable completes the COPY stream.
+        async function* copyData(): AsyncGenerator<string> {
+          for await (const copyLine of reader) {
+            if (copyLine === "\\.") return;
+            yield `${copyLine}\n`;
+          }
         }
-        yield {
-          kind: "copy",
-          statement: line,
-          // COPY text data is newline-delimited. Ending the writable stream
-          // signals COPY completion; the psql-only `\\.` terminator is not SQL.
-          data: copyLines.length > 0 ? `${copyLines.join("\n")}\n` : "",
-        };
+        yield { kind: "copy", statement: line, data: copyData() };
         continue;
       }
       statementLines.push(line);
@@ -1240,7 +1239,7 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
     for await (const item of readRestoreStatements(opts.backupFile)) {
       if (item.kind === "copy") {
         await pipeline(
-          Readable.from([item.data]),
+          Readable.from(item.data),
           await sql.unsafe(item.statement).writable(),
         );
       } else {
