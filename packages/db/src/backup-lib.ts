@@ -15,7 +15,7 @@ import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
-import { Writable } from "node:stream";
+import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -531,7 +531,11 @@ async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
   }
 }
 
-async function* readRestoreStatements(backupFile: string): AsyncGenerator<string> {
+type RestoreStatement =
+  | { kind: "sql"; statement: string }
+  | { kind: "copy"; statement: string; data: string };
+
+async function* readRestoreStatements(backupFile: string): AsyncGenerator<RestoreStatement> {
   const raw = createReadStream(backupFile);
   const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
   stream.setEncoding("utf8");
@@ -541,26 +545,41 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
   });
   let statementLines: string[] = [];
 
-  const flushStatement = () => {
+  const flushStatement = (): RestoreStatement | null => {
     const statement = statementLines.join("\n").trim();
     statementLines = [];
-    return statement;
+    return statement.length > 0 ? { kind: "sql", statement } : null;
   };
 
   try {
     for await (const line of reader) {
       if (line === STATEMENT_BREAKPOINT) {
         const statement = flushStatement();
-        if (statement.length > 0) {
+        if (statement) {
           yield statement;
         }
+        continue;
+      }
+      if (/^COPY\s+.+\s+FROM\s+stdin;$/i.test(line)) {
+        const copyLines: string[] = [];
+        for await (const copyLine of reader) {
+          if (copyLine === "\\.") break;
+          copyLines.push(copyLine);
+        }
+        yield {
+          kind: "copy",
+          statement: line,
+          // COPY text data is newline-delimited. Ending the writable stream
+          // signals COPY completion; the psql-only `\\.` terminator is not SQL.
+          data: copyLines.length > 0 ? `${copyLines.join("\n")}\n` : "",
+        };
         continue;
       }
       statementLines.push(line);
     }
 
     const trailingStatement = flushStatement();
-    if (trailingStatement.length > 0) {
+    if (trailingStatement) {
       yield trailingStatement;
     }
   } finally {
@@ -1218,8 +1237,15 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 
   try {
     await sql`SELECT 1`;
-    for await (const statement of readRestoreStatements(opts.backupFile)) {
-      await sql.unsafe(statement).execute();
+    for await (const item of readRestoreStatements(opts.backupFile)) {
+      if (item.kind === "copy") {
+        await pipeline(
+          Readable.from([item.data]),
+          await sql.unsafe(item.statement).writable(),
+        );
+      } else {
+        await sql.unsafe(item.statement).execute();
+      }
     }
   } catch (error) {
     const statementPreview = typeof error === "object" && error !== null && typeof (error as Record<string, unknown>).query === "string"
