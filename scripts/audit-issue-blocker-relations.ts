@@ -1,7 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { and, eq, inArray } from "../packages/db/node_modules/drizzle-orm/index.js";
 import { companies, createDb, issueRelations, issues } from "../packages/db/src/index.js";
-import { loadConfig } from "../server/src/config.js";
+import { resolveMigrationConnection } from "../packages/db/src/migration-runtime.js";
 
 type InvalidReason = "self" | "ancestor" | "descendant" | "done" | "cancelled";
 type AuditEdge = {
@@ -68,37 +68,19 @@ async function main() {
   const apply = flag("--apply");
   const companyId = value("--company");
   const output = value("--output");
-  const config = loadConfig();
-  const dbUrl = process.env.DATABASE_URL?.trim()
-    || config.databaseUrl
-    || `postgres://paperclip:***@127.0.0.1:${config.embeddedPostgresPort}/paperclip`;
-  const db = createDb(dbUrl);
-  const companyIds = companyId
-    ? [companyId]
-    : (await db.select({ id: companies.id }).from(companies)).map((company) => company.id);
-  const audit: { mode: "dry-run" | "apply"; invalidEdges: AuditEdge[]; deletedEdgeIds: string[]; readbackInvalidEdges: AuditEdge[] } = {
-    mode: apply ? "apply" : "dry-run",
-    invalidEdges: [],
-    deletedEdgeIds: [],
-    readbackInvalidEdges: [],
-  };
+  const connection = await resolveMigrationConnection();
+  const db = createDb(connection.connectionString);
+  try {
+    const companyIds = companyId
+      ? [companyId]
+      : (await db.select({ id: companies.id }).from(companies)).map((company) => company.id);
+    const audit: { mode: "dry-run" | "apply"; invalidEdges: AuditEdge[]; deletedEdgeIds: string[]; readbackInvalidEdges: AuditEdge[] } = {
+      mode: apply ? "apply" : "dry-run",
+      invalidEdges: [],
+      deletedEdgeIds: [],
+      readbackInvalidEdges: [],
+    };
 
-  for (const currentCompanyId of companyIds) {
-    const [issueRows, relationRows] = await Promise.all([
-      db.select({ id: issues.id, parentId: issues.parentId, status: issues.status })
-        .from(issues).where(eq(issues.companyId, currentCompanyId)),
-      db.select({ id: issueRelations.id, companyId: issueRelations.companyId, issueId: issueRelations.issueId, relatedIssueId: issueRelations.relatedIssueId, createdAt: issueRelations.createdAt })
-        .from(issueRelations).where(and(eq(issueRelations.companyId, currentCompanyId), eq(issueRelations.type, "blocks"))),
-    ]);
-    const invalid = invalidEdges(issueRows, relationRows);
-    audit.invalidEdges.push(...invalid);
-    if (apply && invalid.length > 0) {
-      await db.delete(issueRelations).where(and(eq(issueRelations.companyId, currentCompanyId), inArray(issueRelations.id, invalid.map((edge) => edge.id))));
-      audit.deletedEdgeIds.push(...invalid.map((edge) => edge.id));
-    }
-  }
-
-  if (apply) {
     for (const currentCompanyId of companyIds) {
       const [issueRows, relationRows] = await Promise.all([
         db.select({ id: issues.id, parentId: issues.parentId, status: issues.status })
@@ -106,14 +88,34 @@ async function main() {
         db.select({ id: issueRelations.id, companyId: issueRelations.companyId, issueId: issueRelations.issueId, relatedIssueId: issueRelations.relatedIssueId, createdAt: issueRelations.createdAt })
           .from(issueRelations).where(and(eq(issueRelations.companyId, currentCompanyId), eq(issueRelations.type, "blocks"))),
       ]);
-      audit.readbackInvalidEdges.push(...invalidEdges(issueRows, relationRows));
+      const invalid = invalidEdges(issueRows, relationRows);
+      audit.invalidEdges.push(...invalid);
+      if (apply && invalid.length > 0) {
+        await db.delete(issueRelations).where(and(eq(issueRelations.companyId, currentCompanyId), inArray(issueRelations.id, invalid.map((edge) => edge.id))));
+        audit.deletedEdgeIds.push(...invalid.map((edge) => edge.id));
+      }
     }
-  }
 
-  const serialized = `${JSON.stringify(audit, null, 2)}\n`;
-  if (output) await writeFile(output, serialized, "utf8");
-  process.stdout.write(serialized);
-  if (apply && audit.readbackInvalidEdges.length > 0) process.exitCode = 2;
+    if (apply) {
+      for (const currentCompanyId of companyIds) {
+        const [issueRows, relationRows] = await Promise.all([
+          db.select({ id: issues.id, parentId: issues.parentId, status: issues.status })
+            .from(issues).where(eq(issues.companyId, currentCompanyId)),
+          db.select({ id: issueRelations.id, companyId: issueRelations.companyId, issueId: issueRelations.issueId, relatedIssueId: issueRelations.relatedIssueId, createdAt: issueRelations.createdAt })
+            .from(issueRelations).where(and(eq(issueRelations.companyId, currentCompanyId), eq(issueRelations.type, "blocks"))),
+        ]);
+        audit.readbackInvalidEdges.push(...invalidEdges(issueRows, relationRows));
+      }
+    }
+
+    const serialized = `${JSON.stringify(audit, null, 2)}\n`;
+    if (output) await writeFile(output, serialized, "utf8");
+    process.stdout.write(serialized);
+    if (apply && audit.readbackInvalidEdges.length > 0) process.exitCode = 2;
+  } finally {
+    await db.$client?.end?.({ timeout: 5 }).catch(() => undefined);
+    await connection.stop();
+  }
 }
 
 void main().catch((error) => {

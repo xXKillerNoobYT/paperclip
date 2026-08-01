@@ -1,6 +1,6 @@
 # Issue blocker relation audit and repair
 
-`pnpm issue-blockers:audit` scans only direct `blocks` relations for the prohibited stored edges: self, ancestor, descendant, `done`, and `cancelled` blockers. It never adds edges, changes issue hierarchy, statuses, review requirements, device gates, or approval gates.
+`pnpm issue-blockers:audit` scans only direct `blocks` relations for the prohibited stored edges: self, ancestor, descendant, `done`, and `cancelled` blockers. It resolves the database through the same configured migration connection used by local embedded PostgreSQL and explicit `DATABASE_URL` installations. It never adds edges, changes issue hierarchy, statuses, review requirements, device gates, or approval gates.
 
 ## Commands
 
