@@ -3557,6 +3557,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const parentId = randomUUID();
     const subjectId = randomUUID();
     const childId = randomUUID();
+    const grandchildId = randomUUID();
     const siblingId = randomUUID();
     const externalId = randomUUID();
     const doneId = randomUUID();
@@ -3572,6 +3573,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       { id: parentId, companyId, parentId: rootId, title: "Parent", status: "todo", priority: "medium" },
       { id: subjectId, companyId, parentId, title: "Subject", status: "blocked", priority: "medium" },
       { id: childId, companyId, parentId: subjectId, title: "Child", status: "todo", priority: "medium" },
+      { id: grandchildId, companyId, parentId: childId, title: "Grandchild", status: "todo", priority: "medium" },
       { id: siblingId, companyId, parentId, title: "Sibling", status: "todo", priority: "medium" },
       { id: externalId, companyId, title: "External", status: "todo", priority: "medium" },
       { id: doneId, companyId, title: "Done", status: "done", priority: "medium" },
@@ -3594,6 +3596,24 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         blockedBy: [expect.objectContaining({ id: siblingId })],
       });
     }
+
+    // Only the internal review-recovery path may add a direct child blocker.
+    await svc.update(subjectId, {
+      blockedByIssueIds: [childId],
+      allowDirectChildBlocker: true,
+    });
+    await expect(svc.getRelationSummaries(subjectId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: childId })],
+    });
+    await expect(
+      svc.update(subjectId, {
+        blockedByIssueIds: [grandchildId],
+        allowDirectChildBlocker: true,
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "invalid_blocker_relation", reason: "descendant", issueId: subjectId, blockerIssueId: grandchildId },
+    });
 
     await svc.update(subjectId, { blockedByIssueIds: [siblingId, externalId] });
     await expect(svc.getRelationSummaries(subjectId)).resolves.toMatchObject({
