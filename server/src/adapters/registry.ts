@@ -210,6 +210,27 @@ function normalizeHermesConfig<T extends { config?: unknown; agent?: unknown }>(
     agentAdapterConfig.hermesCommand = agentCommand;
   }
 
+  // hermes-paperclip-adapter v0.2.0 only consults config.cwd when choosing
+  // its child-process cwd. Propagate the already-realized Paperclip workspace
+  // so a persisted issue worktree wins over the server process cwd.
+  const workspaceContext =
+    ctx && typeof ctx === "object" && "context" in ctx && ctx.context && typeof ctx.context === "object"
+      ? (ctx.context as Record<string, unknown>)
+      : null;
+  const paperclipWorkspace =
+    workspaceContext?.paperclipWorkspace &&
+    typeof workspaceContext.paperclipWorkspace === "object" &&
+    !Array.isArray(workspaceContext.paperclipWorkspace)
+      ? (workspaceContext.paperclipWorkspace as Record<string, unknown>)
+      : null;
+  const workspaceCwd =
+    typeof paperclipWorkspace?.cwd === "string" && paperclipWorkspace.cwd.trim().length > 0
+      ? paperclipWorkspace.cwd.trim()
+      : null;
+  if (config && workspaceCwd) {
+    config.cwd = workspaceCwd;
+  }
+
   return ctx;
 }
 
