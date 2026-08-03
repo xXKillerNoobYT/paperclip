@@ -2768,7 +2768,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
     if (blockedByIssueIds.length === 0) return null;
 
-    const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    const updated = await issuesSvc.update(issue.id, {
+      status: "blocked",
+      blockedByIssueIds,
+      // This recovery path converts only direct children into the parent's
+      // internal dependency wait; public issue mutations remain disallowed
+      // from adding hierarchical blockers.
+      allowDirectChildBlocker: true,
+    });
     if (!updated) return null;
 
     const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
@@ -3764,8 +3771,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const blockerIds = await existingBlockerIssueIds(sourceIssue.companyId, sourceIssue.id);
     if (!blockerIds.includes(recovery.id)) return false;
+    // A recovery can be terminal before this cleanup runs. Retain only open
+    // blockers when re-syncing so cleanup both removes the terminal recovery
+    // edge and normalizes any previously persisted terminal relation.
+    const unresolvedBlockerIds = await existingUnresolvedBlockerIssueIds(
+      sourceIssue.companyId,
+      sourceIssue.id,
+    );
     await issuesSvc.update(sourceIssue.id, {
-      blockedByIssueIds: blockerIds.filter((blockerId) => blockerId !== recovery.id),
+      blockedByIssueIds: unresolvedBlockerIds.filter((blockerId) => blockerId !== recovery.id),
     });
     return true;
   }
