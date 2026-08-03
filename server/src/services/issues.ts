@@ -6277,6 +6277,7 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        allowDirectChildBlocker?: boolean;
       },
       dbOrTx: any = db,
     ) => {
@@ -6292,6 +6293,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        allowDirectChildBlocker,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -6458,6 +6460,7 @@ export function issueService(db: Db) {
               userId: actorUserId ?? null,
             },
             tx,
+            { allowDirectChildBlocker },
           );
         }
         if (
