@@ -161,11 +161,16 @@ describe("hermes-local adapter onSpawn forwarding", () => {
   it.each([
     "https://credential:secret@example.test/repo.git",
     ["https://credential:secret@example.test/repo.git"],
-  ])("ignores malformed paperclipWorkspace values without leaking them", async (paperclipWorkspace) => {
+    {
+      cwd: { malformed: true },
+      workspaceRepoUrl: "https://credential:secret@example.test/repo.git",
+    },
+  ])("treats malformed or non-object paperclipWorkspace values as absent without leaking them", async (paperclipWorkspace) => {
     const credentialUrl = "https://credential:secret@example.test/repo.git";
+    const configuredCwd = process.cwd();
     const { ctx } = makeCtx({
       worktreeMode: true,
-      cwd: process.cwd(),
+      cwd: configuredCwd,
       env: { PAPERCLIP_WORKSPACE_REPO_URL: credentialUrl },
       context: { paperclipWorkspace },
     });
@@ -173,9 +178,10 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     await execute(ctx as any);
 
     const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
-    const env = (call[3] as { env: Record<string, string> }).env;
+    const opts = call[3] as { cwd: string; env: Record<string, string> };
     const logText = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map(([, chunk]) => String(chunk)).join("\n");
-    expect(env.PAPERCLIP_WORKSPACE_REPO_URL).toBeUndefined();
+    expect(opts.cwd).toBe(configuredCwd);
+    expect(opts.env.PAPERCLIP_WORKSPACE_REPO_URL).toBeUndefined();
     expect(logText).not.toContain(credentialUrl);
   });
 
