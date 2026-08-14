@@ -105,10 +105,11 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     expect(opts.onSpawn).toBe(onSpawn);
   });
 
-  it("uses the realized Paperclip worktree CWD for -w launches", async () => {
+  it("uses the realized Paperclip worktree CWD ahead of configured CWD for -w launches", async () => {
     const worktreeCwd = process.cwd();
     const { ctx } = makeCtx({
       worktreeMode: true,
+      cwd: "/tmp",
       context: { paperclipWorkspace: { cwd: worktreeCwd } },
     });
 
@@ -141,6 +142,41 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
     expect(call[2]).not.toContain("-w");
     expect((call[3] as Record<string, unknown>).cwd).toBe("/tmp");
+  });
+
+  it("falls back to configured CWD when the realized workspace is agent_home", async () => {
+    const configuredCwd = process.cwd();
+    const { ctx } = makeCtx({
+      worktreeMode: true,
+      cwd: configuredCwd,
+      context: { paperclipWorkspace: { cwd: "/tmp", source: "agent_home" } },
+    });
+
+    await execute(ctx as any);
+
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect((call[3] as Record<string, unknown>).cwd).toBe(configuredCwd);
+  });
+
+  it.each([
+    "https://credential:secret@example.test/repo.git",
+    ["https://credential:secret@example.test/repo.git"],
+  ])("ignores malformed paperclipWorkspace values without leaking them", async (paperclipWorkspace) => {
+    const credentialUrl = "https://credential:secret@example.test/repo.git";
+    const { ctx } = makeCtx({
+      worktreeMode: true,
+      cwd: process.cwd(),
+      env: { PAPERCLIP_WORKSPACE_REPO_URL: credentialUrl },
+      context: { paperclipWorkspace },
+    });
+
+    await execute(ctx as any);
+
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    const env = (call[3] as { env: Record<string, string> }).env;
+    const logText = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map(([, chunk]) => String(chunk)).join("\n");
+    expect(env.PAPERCLIP_WORKSPACE_REPO_URL).toBeUndefined();
+    expect(logText).not.toContain(credentialUrl);
   });
 
   it("rejects a worktree launch when no valid Git workspace CWD exists", async () => {

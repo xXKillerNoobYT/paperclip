@@ -85,11 +85,15 @@ async function isGitWorktree(cwd: string): Promise<boolean> {
   }
 }
 
-function realizedWorkspaceCwd(ctx: AdapterExecutionContext): string | undefined {
-  const context = (ctx as { context?: Record<string, unknown> }).context;
-  const workspace = context?.paperclipWorkspace;
-  if (!workspace || typeof workspace !== "object") return undefined;
-  return cfgString((workspace as Record<string, unknown>).cwd);
+function realizedWorkspace(ctx: AdapterExecutionContext): { cwd?: string; source?: string } {
+  const workspace = ctx.context?.paperclipWorkspace;
+  if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)) return {};
+
+  const values = workspace as Record<string, unknown>;
+  return {
+    cwd: cfgString(values.cwd),
+    source: cfgString(values.source),
+  };
 }
 
 export function resolveHermesCommand(config: Record<string, unknown>): string {
@@ -431,17 +435,19 @@ export async function execute(
   // A realized Paperclip workspace is the source of truth for isolated Hermes
   // worktrees. An adapter override wins only when it is itself a Git worktree.
   const explicitCwd = cfgString(config.cwd);
-  const workspaceCwd = realizedWorkspaceCwd(ctx);
+  const explicitCandidate = explicitCwd ? path.resolve(explicitCwd) : undefined;
+  const workspace = realizedWorkspace(ctx);
   let cwd: string;
   if (worktreeMode) {
-    const explicitCandidate = explicitCwd ? path.resolve(explicitCwd) : undefined;
     const explicitIsWorktree = explicitCandidate ? await isGitWorktree(explicitCandidate) : false;
     const candidate = explicitIsWorktree
       ? explicitCandidate
-      : workspaceCwd || cfgString(ctx.config?.workspaceDir);
+      : workspace.source !== "agent_home" && workspace.cwd
+        ? workspace.cwd
+        : explicitCandidate || cfgString(ctx.config?.workspaceDir);
 
     if (!candidate) {
-      const errorMessage = "Hermes worktree routing failed: no realized Git workspace CWD was supplied.";
+      const errorMessage = "Hermes worktree routing failed: no Git workspace CWD was supplied.";
       await ctx.onLog("stderr", `[hermes] ${errorMessage}\n`);
       return { exitCode: 1, signal: null, timedOut: false, provider: resolvedProvider, model, errorMessage };
     }
@@ -527,6 +533,10 @@ export async function execute(
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
   const wakePayloadJson = stringifyPaperclipWakePayload(ctxContext.paperclipWake);
   if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+
+  // Repository URLs can contain credentials. Workspace routing does not need
+  // them in the child environment, so prevent inherited or configured values.
+  delete env.PAPERCLIP_WORKSPACE_REPO_URL;
 
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
