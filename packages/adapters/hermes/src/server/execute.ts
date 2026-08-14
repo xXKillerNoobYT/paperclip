@@ -18,7 +18,9 @@
  *   --source           session source tag for filtering
  */
 
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
+import { promisify } from "node:util";
 import path from "node:path";
 
 import type {
@@ -31,7 +33,6 @@ import {
   runChildProcess,
   buildPaperclipEnv,
   renderTemplate,
-  ensureAbsoluteDirectory,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
   renderPaperclipWakePrompt,
@@ -68,6 +69,31 @@ function cfgStringArray(v: unknown): string[] | undefined {
   return Array.isArray(v) && v.every((i) => typeof i === "string")
     ? (v as string[])
     : undefined;
+}
+
+const execFileAsync = promisify(execFile);
+
+async function isGitWorktree(cwd: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd,
+      timeout: 5_000,
+    });
+    return stdout.trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+function realizedWorkspace(ctx: AdapterExecutionContext): { cwd?: string; source?: string } {
+  const workspace = ctx.context?.paperclipWorkspace;
+  if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)) return {};
+
+  const values = workspace as Record<string, unknown>;
+  return {
+    cwd: cfgString(values.cwd),
+    source: cfgString(values.source),
+  };
 }
 
 export function resolveHermesCommand(config: Record<string, unknown>): string {
@@ -405,6 +431,38 @@ export async function execute(
     prompt = agentInstructions + "\n\n---\n\n" + prompt;
   }
 
+  // ── Resolve working directory ──────────────────────────────────────────
+  // A realized Paperclip workspace is the source of truth for isolated Hermes
+  // worktrees. An adapter override wins only when it is itself a Git worktree.
+  const explicitCwd = cfgString(config.cwd);
+  const explicitCandidate = explicitCwd ? path.resolve(explicitCwd) : undefined;
+  const workspace = realizedWorkspace(ctx);
+  let cwd: string;
+  if (worktreeMode) {
+    const explicitIsWorktree = explicitCandidate ? await isGitWorktree(explicitCandidate) : false;
+    const candidate = explicitIsWorktree
+      ? explicitCandidate
+      : workspace.source !== "agent_home" && workspace.cwd
+        ? workspace.cwd
+        : explicitCandidate || cfgString(ctx.config?.workspaceDir);
+
+    if (!candidate) {
+      const errorMessage = "Hermes worktree routing failed: no Git workspace CWD was supplied.";
+      await ctx.onLog("stderr", `[hermes] ${errorMessage}\n`);
+      return { exitCode: 1, signal: null, timedOut: false, provider: resolvedProvider, model, errorMessage };
+    }
+
+    cwd = path.resolve(candidate);
+    if (!(await isGitWorktree(cwd))) {
+      const errorMessage = `Hermes worktree routing failed: resolved CWD is not a Git worktree: ${cwd}`;
+      await ctx.onLog("stderr", `[hermes] ${errorMessage}\n`);
+      return { exitCode: 1, signal: null, timedOut: false, provider: resolvedProvider, model, errorMessage };
+    }
+  } else {
+    // Preserve ordinary non-worktree behavior, including the historical "." fallback.
+    cwd = explicitCwd || cfgString(ctx.config?.workspaceDir) || ".";
+  }
+
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
@@ -476,14 +534,9 @@ export async function execute(
   const wakePayloadJson = stringifyPaperclipWakePayload(ctxContext.paperclipWake);
   if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
 
-  // ── Resolve working directory ──────────────────────────────────────────
-  const cwd =
-    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
-  try {
-    await ensureAbsoluteDirectory(cwd);
-  } catch {
-    // Non-fatal
-  }
+  // Repository URLs can contain credentials. Workspace routing does not need
+  // them in the child environment, so prevent inherited or configured values.
+  delete env.PAPERCLIP_WORKSPACE_REPO_URL;
 
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(

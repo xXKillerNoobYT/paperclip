@@ -69,6 +69,7 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
         issueId: "issue-1",
         wakeReason: "manual",
         paperclipWake: null,
+        ...((overrides.context as Record<string, unknown> | undefined) ?? {}),
       },
       onLog: vi.fn(async () => undefined),
       onMeta: vi.fn(async () => undefined),
@@ -102,6 +103,99 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
     const opts = lastCall[3] as Record<string, unknown>;
     expect(opts.onSpawn).toBe(onSpawn);
+  });
+
+  it("uses the realized Paperclip worktree CWD ahead of configured CWD for -w launches", async () => {
+    const worktreeCwd = process.cwd();
+    const { ctx } = makeCtx({
+      worktreeMode: true,
+      cwd: "/tmp",
+      context: { paperclipWorkspace: { cwd: worktreeCwd } },
+    });
+
+    await execute(ctx as any);
+
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect(call[2]).toContain("-w");
+    expect((call[3] as Record<string, unknown>).cwd).toBe(worktreeCwd);
+  });
+
+  it("preserves a valid explicit CWD override for a worktree launch", async () => {
+    const explicitCwd = process.cwd();
+    const { ctx } = makeCtx({
+      worktreeMode: true,
+      cwd: explicitCwd,
+      context: { paperclipWorkspace: { cwd: "/tmp" } },
+    });
+
+    await execute(ctx as any);
+
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect((call[3] as Record<string, unknown>).cwd).toBe(explicitCwd);
+  });
+
+  it("preserves ordinary non-worktree CWD behavior", async () => {
+    const { ctx } = makeCtx({ cwd: "/tmp" });
+
+    await execute(ctx as any);
+
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect(call[2]).not.toContain("-w");
+    expect((call[3] as Record<string, unknown>).cwd).toBe("/tmp");
+  });
+
+  it("falls back to configured CWD when the realized workspace is agent_home", async () => {
+    const configuredCwd = process.cwd();
+    const { ctx } = makeCtx({
+      worktreeMode: true,
+      cwd: configuredCwd,
+      context: { paperclipWorkspace: { cwd: "/tmp", source: "agent_home" } },
+    });
+
+    await execute(ctx as any);
+
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    expect((call[3] as Record<string, unknown>).cwd).toBe(configuredCwd);
+  });
+
+  it.each([
+    "https://credential:secret@example.test/repo.git",
+    ["https://credential:secret@example.test/repo.git"],
+    {
+      cwd: { malformed: true },
+      workspaceRepoUrl: "https://credential:secret@example.test/repo.git",
+    },
+  ])("treats malformed or non-object paperclipWorkspace values as absent without leaking them", async (paperclipWorkspace) => {
+    const credentialUrl = "https://credential:secret@example.test/repo.git";
+    const configuredCwd = process.cwd();
+    const { ctx } = makeCtx({
+      worktreeMode: true,
+      cwd: configuredCwd,
+      env: { PAPERCLIP_WORKSPACE_REPO_URL: credentialUrl },
+      context: { paperclipWorkspace },
+    });
+
+    await execute(ctx as any);
+
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    const opts = call[3] as { cwd: string; env: Record<string, string> };
+    const logText = (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls.map(([, chunk]) => String(chunk)).join("\n");
+    expect(opts.cwd).toBe(configuredCwd);
+    expect(opts.env.PAPERCLIP_WORKSPACE_REPO_URL).toBeUndefined();
+    expect(logText).not.toContain(credentialUrl);
+  });
+
+  it("rejects a worktree launch when no valid Git workspace CWD exists", async () => {
+    const { ctx } = makeCtx({
+      worktreeMode: true,
+      context: { paperclipWorkspace: { cwd: "/tmp" } },
+    });
+
+    const result = await execute(ctx as any);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("not a Git worktree");
+    expect(serverUtils.runChildProcess).not.toHaveBeenCalled();
   });
 
   it("runChildProcess opts type includes onSpawn", () => {
