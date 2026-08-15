@@ -478,7 +478,7 @@ describe("issue update comment wakeups", () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
-      status: "in_progress",
+      status: "todo",
     });
     mockIssueService.getById.mockResolvedValue(existing);
     mockIssueService.addComment.mockResolvedValue({
