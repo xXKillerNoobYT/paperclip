@@ -3483,20 +3483,34 @@ export function issueRoutes(
     fields: string[];
   };
 
-  function isCtoLivenessRepairPayload(input: unknown): input is Record<string, unknown> {
+  function isCtoLivenessRepairPayload(
+    issue: { status: string },
+    input: unknown,
+  ): input is Record<string, unknown> {
     if (!input || typeof input !== "object" || Array.isArray(input)) return false;
-    const fields = Object.keys(input);
+    const payload = input as Record<string, unknown>;
+    const fields = Object.keys(payload);
     if (fields.length === 0) return false;
     const allowedFields = new Set(["status", "comment", "blockedByIssueIds"]);
-    return fields.every((field) => allowedFields.has(field));
+    if (!fields.every((field) => allowedFields.has(field))) return false;
+
+    // This is a repair lane for stale blocked topology, not a general CTO issue
+    // management grant. Requiring an attributed audit comment and limiting the
+    // only state transition to blocked -> todo prevents terminal side effects
+    // (completion/cancellation telemetry, handoffs, and wakeups) from bypassing
+    // the ordinary ownership boundary.
+    if (issue.status !== "blocked" || typeof payload.comment !== "string" || payload.comment.trim().length === 0) {
+      return false;
+    }
+    return payload.status === undefined || payload.status === "blocked" || payload.status === "todo";
   }
 
   async function authorizeCtoLivenessRepair(
     req: Request,
-    issue: { companyId: string },
+    issue: { companyId: string; status: string },
     input: unknown,
   ): Promise<CtoLivenessRepairAuthorization> {
-    if (req.actor.type !== "agent" || !req.actor.agentId || !isCtoLivenessRepairPayload(input)) {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !isCtoLivenessRepairPayload(issue, input)) {
       return { allowed: false, fields: [] };
     }
     const runId = req.actor.runId?.trim();
