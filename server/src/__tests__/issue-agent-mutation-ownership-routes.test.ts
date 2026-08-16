@@ -1511,6 +1511,150 @@ describe("agent issue mutation checkout ownership", () => {
     });
   });
 
+  it("allows a running same-company CTO to repair only liveness status, audit comment, and direct blockers", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }),
+      ...patch,
+    }));
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-cto", body: "Audited liveness repair." });
+    mockAgentService.getById.mockResolvedValue(makeAgent(peerAgentId, { role: "cto" }));
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "66666666-6666-4666-8666-666666666666",
+      companyId,
+      agentId: peerAgentId,
+      status: "running",
+    });
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_explicit_grant" : "deny_missing_grant",
+      explanation: "CTO repair must use the narrow route-level grant.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", comment: "Audited liveness repair.", blockedByIssueIds: [] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ status: "todo", actorAgentId: peerAgentId }),
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "Audited liveness repair.",
+      expect.objectContaining({ agentId: peerAgentId, runId: "66666666-6666-4666-8666-666666666666" }),
+      expect.any(Object),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "issue.cto_liveness_repaired",
+      agentId: peerAgentId,
+      runId: "66666666-6666-4666-8666-666666666666",
+      details: expect.objectContaining({ fields: ["blockedByIssueIds", "comment", "status"] }),
+    }));
+  });
+
+  it("keeps non-liveness CTO payloads denied across another agent's issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockAgentService.getById.mockResolvedValue(makeAgent(peerAgentId, { role: "cto" }));
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "66666666-6666-4666-8666-666666666666",
+      companyId,
+      agentId: peerAgentId,
+      status: "running",
+    });
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "CTO repair must use the narrow route-level grant.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: peerAgentId });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["content", { description: "Unauthorized content rewrite." }],
+    ["assignment", { assigneeAgentId: peerAgentId }],
+    ["configuration", { executionPolicy: null }],
+    ["unknown secret-shaped field", { secretRef: "do-not-store" }],
+    ["terminal completion", { status: "done", comment: "Audit required." }],
+    ["terminal cancellation", { status: "cancelled", comment: "Audit required." }],
+    ["missing audit comment", { status: "todo" }],
+    ["blank audit comment", { status: "todo", comment: "  " }],
+  ])("denies a CTO liveness repair attempt that includes %s mutation", async (_kind, payload) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockAgentService.getById.mockResolvedValue(makeAgent(peerAgentId, { role: "cto" }));
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "66666666-6666-4666-8666-666666666666",
+      companyId,
+      agentId: peerAgentId,
+      status: "running",
+    });
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "CTO repair must use the narrow route-level grant.",
+    }));
+
+    const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send(payload);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["foreign-company CTO", makeAgent(peerAgentId, { role: "cto", companyId: "other-company" }), {
+      id: "66666666-6666-4666-8666-666666666666",
+      companyId,
+      agentId: peerAgentId,
+      status: "running",
+    }],
+    ["foreign-company run", makeAgent(peerAgentId, { role: "cto" }), {
+      id: "66666666-6666-4666-8666-666666666666",
+      companyId: "other-company",
+      agentId: peerAgentId,
+      status: "running",
+    }],
+    ["mismatched run agent", makeAgent(peerAgentId, { role: "cto" }), {
+      id: "66666666-6666-4666-8666-666666666666",
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+    }],
+    ["non-running run", makeAgent(peerAgentId, { role: "cto" }), {
+      id: "66666666-6666-4666-8666-666666666666",
+      companyId,
+      agentId: peerAgentId,
+      status: "succeeded",
+    }],
+  ])("denies a CTO liveness repair with a %s binding", async (_kind, actorAgent, run) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
+    mockAgentService.getById.mockResolvedValue(actorAgent);
+    mockHeartbeatService.getRun.mockResolvedValue(run);
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: "deny_missing_grant",
+      explanation: "CTO repair must use the narrow route-level grant.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "todo", comment: "Audited liveness repair." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("rejects peer-agent status updates that would clear a recovery action they do not own", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" }),

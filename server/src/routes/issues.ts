@@ -3478,6 +3478,61 @@ export function issueRoutes(
     return decision.allowed;
   }
 
+  type CtoLivenessRepairAuthorization = {
+    allowed: boolean;
+    fields: string[];
+  };
+
+  function isCtoLivenessRepairPayload(
+    issue: { status: string },
+    input: unknown,
+  ): input is Record<string, unknown> {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return false;
+    const payload = input as Record<string, unknown>;
+    const fields = Object.keys(payload);
+    if (fields.length === 0) return false;
+    const allowedFields = new Set(["status", "comment", "blockedByIssueIds"]);
+    if (!fields.every((field) => allowedFields.has(field))) return false;
+
+    // This is a repair lane for stale blocked topology, not a general CTO issue
+    // management grant. Requiring an attributed audit comment and limiting the
+    // only state transition to blocked -> todo prevents terminal side effects
+    // (completion/cancellation telemetry, handoffs, and wakeups) from bypassing
+    // the ordinary ownership boundary.
+    if (issue.status !== "blocked" || typeof payload.comment !== "string" || payload.comment.trim().length === 0) {
+      return false;
+    }
+    return payload.status === undefined || payload.status === "blocked" || payload.status === "todo";
+  }
+
+  async function authorizeCtoLivenessRepair(
+    req: Request,
+    issue: { companyId: string; status: string },
+    input: unknown,
+  ): Promise<CtoLivenessRepairAuthorization> {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !isCtoLivenessRepairPayload(issue, input)) {
+      return { allowed: false, fields: [] };
+    }
+    const runId = req.actor.runId?.trim();
+    if (!runId) return { allowed: false, fields: [] };
+
+    const [actorAgent, run] = await Promise.all([
+      agentsSvc.getById(req.actor.agentId),
+      heartbeat.getRun(runId),
+    ]);
+    if (
+      actorAgent?.companyId !== issue.companyId ||
+      actorAgent.role !== "cto" ||
+      run?.companyId !== issue.companyId ||
+      run.agentId !== req.actor.agentId ||
+      run.status !== "running"
+    ) {
+      return { allowed: false, fields: [] };
+    }
+
+    return { allowed: true, fields: Object.keys(input).sort() };
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -3490,6 +3545,7 @@ export function issueRoutes(
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
     },
+    ctoLivenessRepairAllowed = false,
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -3522,6 +3578,7 @@ export function issueRoutes(
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
+      if (ctoLivenessRepairAllowed) return true;
       res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
       return false;
     }
@@ -3529,6 +3586,7 @@ export function issueRoutes(
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
+      if (ctoLivenessRepairAllowed) return true;
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
         return true;
       }
@@ -7450,7 +7508,8 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    const ctoLivenessRepair = await authorizeCtoLivenessRepair(req, existing, req.body);
+    if (!(await assertAgentIssueMutationAllowed(req, res, existing, ctoLivenessRepair.allowed))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -7984,6 +8043,24 @@ export function issueRoutes(
         ),
       },
     });
+
+    if (ctoLivenessRepair.allowed) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.cto_liveness_repaired",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          fields: ctoLivenessRepair.fields,
+          source: "cto_liveness_repair",
+        },
+      });
+    }
 
     if (existing.status === "in_progress" && issue.status !== existing.status && issue.status !== "in_progress") {
       await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id])
