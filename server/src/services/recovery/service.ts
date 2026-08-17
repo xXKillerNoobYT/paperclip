@@ -1858,8 +1858,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const roleCandidates = await db
       .select()
       .from(agents)
-      .where(and(eq(agents.companyId, issue.companyId), inArray(agents.role, ["cto", "ceo"])))
-      .orderBy(sql`case when ${agents.role} = 'cto' then 0 else 1 end`, asc(agents.createdAt));
+      .where(and(eq(agents.companyId, issue.companyId), eq(agents.role, "cto")))
+      .orderBy(asc(agents.createdAt));
     candidateIds.push(...roleCandidates.map((agent) => agent.id));
     if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
 
@@ -1869,6 +1869,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       seen.add(agentId);
       const candidate = await getAgent(agentId);
       if (!candidate || candidate.companyId !== issue.companyId) continue;
+      if (candidate.role === "ceo") continue;
       const budgetBlock = await budgets.getInvocationBlock(issue.companyId, candidate.id, {
         issueId: issue.id,
         projectId: issue.projectId,
@@ -2201,7 +2202,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
       "- Guard: recovery issues do not create nested `stranded_issue_recovery` issues.",
       "",
-      "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
+      "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution; this recovery issue stays `todo` so it remains in the actionable queue.",
     ].join("\n");
   }
 
@@ -2210,7 +2211,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: "todo" | "in_progress";
     latestRun: LatestIssueRun;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+    const updated = await issuesSvc.update(input.issue.id, { status: "todo" });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -2236,7 +2237,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
+        status: "todo",
         previousStatus: input.previousStatus,
         source: "recovery.reconcile_stranded_recovery_issue",
         latestRunId: input.latestRun?.id ?? null,
@@ -2294,7 +2295,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
-    if (isStrandedIssueRecoveryIssue(input.issue)) {
+    // Recovery/liveness issues are already control-plane escalation artifacts. If
+    // they themselves strand, keep the failure visible on that issue instead of
+    // creating a nested recovery action or waking the same executive/manager in a
+    // status-only loop.
+    if (isRecoveryOriginIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
         previousStatus: input.previousStatus,
@@ -2311,8 +2316,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const nextStatus = blockerIds.length > 0 ? "blocked" : "todo";
     const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
+      status: nextStatus,
       blockedByIssueIds: blockerIds,
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
     });
@@ -2338,6 +2344,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
+    const statusDispositionCopy = nextStatus === "blocked"
+      ? "Moving it to `blocked` because unresolved first-class blocker issues are linked."
+      : "Keeping it `todo` because no unresolved first-class blocker issues are linked, so recovery owner action remains visible in the actionable queue.";
+    const normalizedComment = input.comment
+      ?.replace(/Moving it to `blocked` so it is visible for intervention\./g, statusDispositionCopy)
+      .replace(/moving it to `blocked` so it is visible for intervention\./g, statusDispositionCopy);
     const recoveryLine = recoveryAction.ownerAgentId
       ? [
         "",
@@ -2382,7 +2394,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             metadata: notice.metadata,
           });
         } else {
-          await issuesSvc.addComment(input.issue.id, `${input.comment ?? ""}${recoveryLine}`, {}, {
+          await issuesSvc.addComment(input.issue.id, `${normalizedComment ?? ""}${recoveryLine}`, {}, {
             authorType: "system",
           });
         }
@@ -2402,7 +2414,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
+        status: nextStatus,
         previousStatus: input.previousStatus,
         source: input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "recovery.reconcile_successful_run_handoff_missing_state"
@@ -2439,11 +2451,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .limit(1);
       if (
         currentIssue &&
-        (currentIssue.status !== "blocked" ||
+        (currentIssue.status !== nextStatus ||
           currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
       ) {
         const reblocked = await issuesSvc.update(input.issue.id, {
-          status: "blocked",
+          status: nextStatus,
           blockedByIssueIds: blockerIds,
           assigneeAgentId: recoveryAction.ownerAgentId,
         });
@@ -2503,7 +2515,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
-      if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
+      if (
+        isRecoveryOriginIssue(issue) &&
+        latestRun &&
+        (isUnsuccessfulTerminalIssueRun(latestRun) || isSuccessfulInProgressContinuationRun(latestRun))
+      ) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
           issue,
           previousStatus: issue.status as "todo" | "in_progress",

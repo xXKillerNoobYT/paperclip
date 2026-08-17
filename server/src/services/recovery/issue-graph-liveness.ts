@@ -4,6 +4,7 @@ import { buildIssueGraphLivenessIncidentKey } from "./origins.js";
 export type IssueLivenessSeverity = "warning" | "critical";
 
 export type IssueLivenessState =
+  | "blocked_without_unblock_path"
   | "blocked_by_unassigned_issue"
   | "blocked_by_assigned_backlog_issue"
   | "blocked_by_uninvokable_assignee"
@@ -589,9 +590,34 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     return null;
   }
 
+  function blockedWithoutUnblockPathFinding(issue: IssueLivenessIssueInput): IssueLivenessFinding | null {
+    if (hasExplicitWaitingPath(issue)) return null;
+
+    const ownerCandidates = ownerCandidatesForRecoveryIssue(issue, input.agents, agentsById);
+
+    return finding({
+      issue,
+      state: "blocked_without_unblock_path",
+      reason: `${issueLabel(issue)} is blocked but has no first-class blocker, human owner, scheduled monitor, pending interaction, approval, wake, active run, or recovery issue owning the next action.`,
+      dependencyPath: [issue],
+      recoveryIssue: issue,
+      recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+      recommendedOwnerCandidates: ownerCandidates,
+      recommendedAction:
+        `Choose an explicit disposition for ${issueLabel(issue)}: move it to todo/backlog if work remains, mark it done/cancelled if complete, or attach a first-class blocker or owner action before leaving it blocked.`,
+      blockerIssueId: issue.id,
+    });
+  }
+
   for (const issue of input.issues) {
     if (issue.status === "blocked") {
       if (unresolvedBlockers.has(issue.id)) continue;
+      const topLevelRelations = blockersByBlockedIssueId.get(issue.id) ?? [];
+      if (topLevelRelations.length === 0) {
+        const missingPathFinding = blockedWithoutUnblockPathFinding(issue);
+        if (missingPathFinding) findings.push(missingPathFinding);
+        continue;
+      }
       const chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
       if (chainFinding) findings.push(chainFinding);
     }

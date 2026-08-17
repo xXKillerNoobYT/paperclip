@@ -46,6 +46,37 @@ const manager = agent({
 const blocks = [{ companyId, blockerIssueId: blockerId, blockedIssueId: blockedId }];
 
 describe("issue graph liveness classifier", () => {
+  it("detects a blocked issue with no blocker links or explicit owner action", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [issue()],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: blockedId,
+      identifier: "PAP-1703",
+      state: "blocked_without_unblock_path",
+      recoveryIssueId: blockedId,
+      recommendedOwnerAgentId: managerId,
+      dependencyPath: [
+        expect.objectContaining({ issueId: blockedId }),
+      ],
+      incidentKey: `harness_liveness:${companyId}:${blockedId}:blocked_without_unblock_path:${blockedId}`,
+    });
+  });
+
+  it("does not flag a blocked issue without blocker links when a human owner is explicit", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [issue({ assigneeAgentId: null, assigneeUserId: "board-user-1" })],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
   it("detects a PAP-1703-style blocked chain with an unassigned blocker and stable incident key", () => {
     const findings = classifyIssueGraphLiveness({
       issues: [

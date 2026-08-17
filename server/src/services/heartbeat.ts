@@ -6866,6 +6866,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const wakeCommentId = deriveCommentId(context, null);
     const isInteractionWake = allowsIssueInteractionWake(context);
+    const explicitReopenIntent = context.explicitReopenIntent === true;
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
@@ -6914,12 +6915,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (issue.status === "done" || issue.status === "cancelled") {
-      if (!resumeIntent && !wakeCommentId) {
+      if (!resumeIntent && !explicitReopenIntent) {
         return {
           stale: true,
           errorCode: "issue_terminal_status",
           reason: `Cancelled because issue reached terminal status (${issue.status}) before the queued run could start`,
-          details: { issueId, currentStatus: issue.status },
+          details: {
+            issueId,
+            currentStatus: issue.status,
+            wakeCommentId,
+            wakeReason,
+          },
         };
       }
     }
@@ -9464,15 +9470,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
-        // Only human/comment-reopen interactions should revive completed issues;
-        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
+        const deferredHasExplicitReopenIntent = deferredContextSeed.explicitReopenIntent === true
+          || deferredPayload.explicitReopenIntent === true
+          || deferredContextSeed.resumeIntent === true
+          || deferredPayload.resumeIntent === true;
+        const deferredCommentRows = deferredCommentIds.length > 0
+          ? await tx
+            .select({
+              id: issueComments.id,
+              authorType: issueComments.authorType,
+              authorAgentId: issueComments.authorAgentId,
+              createdByRunId: issueComments.createdByRunId,
+            })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, issue.companyId),
+                eq(issueComments.issueId, issue.id),
+                inArray(issueComments.id, deferredCommentIds),
+                isNull(issueComments.deletedAt),
+              ),
+            )
+          : [];
+        const hasHumanDeferredComment = deferredCommentRows.some((comment) =>
+          comment.authorType !== "agent" &&
+          !comment.authorAgentId &&
+          !comment.createdByRunId
+        );
+        // Only explicit reopen/resume interactions should revive completed issues;
+        // bookkeeping/operator comments and old deferred comment wakes must not
+        // reopen closed work just because a comment exists.
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
           (issue.status === "done" || issue.status === "cancelled") &&
-          (
-            deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
-          );
+          deferredWakeReason === "issue_reopened_via_comment" &&
+          deferredHasExplicitReopenIntent &&
+          (deferred.requestedByActorType === "user" || deferred.requestedByActorType === "agent" || hasHumanDeferredComment);
+        if ((issue.status === "done" || issue.status === "cancelled") && !shouldReopenDeferredCommentWake) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: `Deferred wake suppressed because issue is ${issue.status}; explicit reopen/resume intent is required`,
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {

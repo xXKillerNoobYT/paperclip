@@ -441,13 +441,32 @@ const hermesLocalAdapter: ServerAdapterModule = {
   type: "hermes_local",
   execute: async (ctx) => {
     const normalizedCtx = normalizeHermesConfig(ctx);
-    if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
-
-    const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
+    const runtimeConfig =
+      normalizedCtx.config && typeof normalizedCtx.config === "object"
+        ? (normalizedCtx.config as Record<string, unknown>)
+        : {};
+    const agentConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;
+    // Heartbeat resolves env bindings/secrets into ctx.config before adapter execution.
+    // hermes-paperclip-adapter@0.2.0 reads ctx.agent.adapterConfig, so copy the
+    // resolved runtime config back onto the agent config before invoking it. Otherwise
+    // persisted env binding descriptors such as {type:"plain", value:"/Users/IA/.hermes"}
+    // leak into child_process env as "[object Object]" and Hermes looks in the wrong home.
+    const existingConfig = { ...agentConfig, ...runtimeConfig };
     const existingEnv =
       typeof existingConfig.env === "object" && existingConfig.env !== null && !Array.isArray(existingConfig.env)
         ? (existingConfig.env as Record<string, string>)
         : {};
+
+    if (!normalizedCtx.authToken) {
+      return executeHermesLocal({
+        ...normalizedCtx,
+        agent: {
+          ...normalizedCtx.agent,
+          adapterConfig: existingConfig,
+        },
+      });
+    }
+
     const explicitApiKey =
       typeof existingEnv.PAPERCLIP_API_KEY === "string" && existingEnv.PAPERCLIP_API_KEY.trim().length > 0;
     const promptTemplate =

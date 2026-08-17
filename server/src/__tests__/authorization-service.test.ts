@@ -562,6 +562,103 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("allows a CEO agent to mutate same-company issues assigned to another agent", async () => {
+    const company = await createCompany(db, "CeoCrossIssueMutation");
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetIssue = await createIssue(db, company.id, { assigneeAgentId: targetAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: targetIssue.id,
+        assigneeAgentId: targetAgent.id,
+        status: targetIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_legacy_agent_creator",
+    });
+  });
+
+  it("allows a manager agent to mutate issues assigned inside its reporting subtree", async () => {
+    const company = await createCompany(db, "ManagerCrossIssueMutation");
+    const managerAgent = await createAgent(db, company.id, { role: "cto" });
+    const childAgent = await createAgent(db, company.id, { role: "engineer", reportsTo: managerAgent.id });
+    const targetIssue = await createIssue(db, company.id, { assigneeAgentId: childAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: targetIssue.id,
+        assigneeAgentId: childAgent.id,
+        status: targetIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+  });
+
+  it("denies a specialist agent mutating a peer's same-company issue", async () => {
+    const company = await createCompany(db, "SpecialistCrossIssueMutationDenied");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetAgent = await createAgent(db, company.id, { role: "engineer" });
+    const targetIssue = await createIssue(db, company.id, { assigneeAgentId: targetAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: targetIssue.id,
+        assigneeAgentId: targetAgent.id,
+        status: targetIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("denies CEO issue mutation across company boundaries", async () => {
+    const sourceCompany = await createCompany(db, "CeoIssueMutationSource");
+    const targetCompany = await createCompany(db, "CeoIssueMutationTarget");
+    const ceoAgent = await createAgent(db, sourceCompany.id, { role: "ceo" });
+    const targetAgent = await createAgent(db, targetCompany.id, { role: "engineer" });
+    const targetIssue = await createIssue(db, targetCompany.id, { assigneeAgentId: targetAgent.id });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: sourceCompany.id, source: "agent_key" },
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: targetCompany.id,
+        issueId: targetIssue.id,
+        assigneeAgentId: targetAgent.id,
+        status: targetIssue.status,
+      },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_company_boundary",
+    });
+  });
+
   it("allows scoped assignment inside a granted project and denies other projects", async () => {
     const company = await createCompany(db, "ProjectScope");
     const project = await createProject(db, company.id, "Allowed");

@@ -710,10 +710,12 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   actorType: "agent" | "user";
   actorId: string;
 }) {
-  // Only human comments should implicitly reopen finished work.
+  // Only human comments should implicitly resume blocked work.
+  // Done/cancelled work must require explicit reopen/resume intent; otherwise
+  // bookkeeping closeout comments create completed-work churn and duplicate runs.
   // Agent-authored comments remain communicative unless reopen was explicit.
   if (input.actorType !== "user") return false;
-  if (!isClosedIssueStatus(input.issueStatus) && input.issueStatus !== "blocked") return false;
+  if (input.issueStatus !== "blocked") return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
   return true;
 }
@@ -1408,6 +1410,19 @@ export function issueRoutes(
     return null;
   }
 
+  function normalizeRepeatedStringQuery(value: unknown) {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) {
+      return value
+        .filter((item): item is string => typeof item === "string")
+        .flatMap((item) => item.split(","))
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .join(",");
+    }
+    return undefined;
+  }
+
   function shouldIncludeDocumentAnnotations(req: Request) {
     if (req.query.includeAnnotations === "false" || req.query.includeAnnotations === "0") return false;
     return req.actor.type === "agent" || parseBooleanQuery(req.query.includeAnnotations);
@@ -1753,6 +1768,8 @@ export function issueRoutes(
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
+      const runId = requireAgentRunId(req, res);
+      if (!runId) return false;
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
         return true;
       }
@@ -2356,7 +2373,7 @@ export function issueRoutes(
 
     const rawResult = await svc.list(companyId, {
       attention: attention === "blocked" ? "blocked" : undefined,
-      status: req.query.status as string | undefined,
+      status: normalizeRepeatedStringQuery(req.query.status),
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
       participantAgentId: req.query.participantAgentId as string | undefined,
       assigneeUserId,
@@ -2436,7 +2453,7 @@ export function issueRoutes(
 
     const blockedCountFilters = {
       attention: "blocked",
-      status: req.query.status as string | undefined,
+      status: normalizeRepeatedStringQuery(req.query.status),
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
       participantAgentId: req.query.participantAgentId as string | undefined,
       assigneeUserId: req.query.assigneeUserId as string | undefined,
@@ -4662,8 +4679,10 @@ export function issueRoutes(
       hiddenAt: hiddenAtRaw,
       ...updateFields
     } = req.body;
-    const shouldCancelActiveRunForCancelledStatus =
-      existing.status !== "cancelled" && updateFields.status === "cancelled";
+    const shouldCancelActiveRunForTerminalStatus =
+      !isClosedIssueStatus(existing.status) &&
+      typeof updateFields.status === "string" &&
+      isClosedIssueStatus(updateFields.status);
     if (resumeRequested === true && !commentBody) {
       res.status(400).json({ error: "Follow-up intent requires a comment" });
       return;
@@ -4779,7 +4798,7 @@ export function issueRoutes(
       }
     }
 
-    const runToCancelForCancelledStatus = shouldCancelActiveRunForCancelledStatus
+    const runToCancelForTerminalStatus = shouldCancelActiveRunForTerminalStatus
       ? await resolveActiveIssueRun(existing)
       : null;
 
@@ -4984,9 +5003,12 @@ export function issueRoutes(
     }
 
     let cancelledStatusRunId: string | null = null;
-    if (runToCancelForCancelledStatus) {
+    if (runToCancelForTerminalStatus) {
       try {
-        const cancelled = await heartbeat.cancelRun(runToCancelForCancelledStatus.id);
+        const cancelled = await heartbeat.cancelRun(
+          runToCancelForTerminalStatus.id,
+          `Cancelled because issue was marked ${updateFields.status}`,
+        );
         if (cancelled) {
           cancelledStatusRunId = cancelled.id;
           await logActivity(db, {
@@ -4998,11 +5020,11 @@ export function issueRoutes(
             action: "heartbeat.cancelled",
             entityType: "heartbeat_run",
             entityId: cancelled.id,
-            details: { agentId: cancelled.agentId, source: "issue_status_cancelled", issueId: existing.id },
+            details: { agentId: cancelled.agentId, source: "issue_status_terminal", issueId: existing.id, status: issue.status },
           });
         }
       } catch (err) {
-        logger.warn({ err, issueId: existing.id, runId: runToCancelForCancelledStatus.id }, "failed to cancel run for cancelled issue");
+        logger.warn({ err, issueId: existing.id, runId: runToCancelForTerminalStatus.id }, "failed to cancel run for terminal issue");
         await logActivity(db, {
           companyId: existing.companyId,
           actorType: actor.actorType,
@@ -5011,8 +5033,8 @@ export function issueRoutes(
           runId: actor.runId,
           action: "heartbeat.cancel_failed",
           entityType: "heartbeat_run",
-          entityId: runToCancelForCancelledStatus.id,
-          details: { source: "issue_status_cancelled", issueId: existing.id },
+          entityId: runToCancelForTerminalStatus.id,
+          details: { source: "issue_status_terminal", issueId: existing.id, status: updateFields.status },
         });
       }
     }
@@ -5501,6 +5523,7 @@ export function issueRoutes(
               issueId: id,
               commentId: comment.id,
               mutation: "comment",
+              ...(reopened && explicitMoveToTodoRequested ? { explicitReopenIntent: true } : {}),
               ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
@@ -5514,6 +5537,7 @@ export function issueRoutes(
               wakeCommentId: comment.id,
               source: reopened ? "issue.comment.reopen" : "issue.comment",
               wakeReason: reopened ? "issue_reopened_via_comment" : "issue_commented",
+              ...(reopened && explicitMoveToTodoRequested ? { explicitReopenIntent: true } : {}),
               ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
@@ -6669,6 +6693,7 @@ export function issueRoutes(
               commentId: comment.id,
               reopenedFrom: reopenFromStatus,
               mutation: "comment",
+              ...(explicitMoveToTodoRequested ? { explicitReopenIntent: true } : {}),
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
             },
@@ -6682,6 +6707,7 @@ export function issueRoutes(
               source: "issue.comment.reopen",
               wakeReason: "issue_reopened_via_comment",
               reopenedFrom: reopenFromStatus,
+              ...(explicitMoveToTodoRequested ? { explicitReopenIntent: true } : {}),
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
             },

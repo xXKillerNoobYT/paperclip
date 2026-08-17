@@ -261,6 +261,40 @@ describe("claude execute", () => {
     }
   });
 
+  it("does not pass Paperclip timestamp display ids to Claude --resume", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-display-id-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    const logs: string[] = [];
+    try {
+      await execute({
+        runId: "run-display-id",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: {
+          sessionId: "legacy-session-id",
+          sessionParams: { sessionId: "20260618_161402_209655" },
+          sessionDisplayId: "20260618_161402_209655",
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+        onMeta: async () => {},
+      });
+      const captured = JSON.parse(await fs.readFile(capturePath, "utf-8"));
+      expect(captured.argv).not.toContain("--resume");
+      expect(logs.join("")).toContain("looks like a Paperclip display id");
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   /**
    * Regression tests for commandNotes accuracy (Greptile P2).
    *

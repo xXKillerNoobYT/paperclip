@@ -4,6 +4,11 @@ import { goals } from "@paperclipai/db";
 
 type GoalReader = Pick<Db, "select">;
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function isUuid(value: string) {
+  return UUID_RE.test(value);
+}
+
 export async function getDefaultCompanyGoal(db: GoalReader, companyId: string) {
   const activeRootGoal = await db
     .select()
@@ -46,12 +51,14 @@ export function goalService(db: Db) {
   return {
     list: (companyId: string) => db.select().from(goals).where(eq(goals.companyId, companyId)),
 
-    getById: (id: string) =>
-      db
+    getById: (id: string) => {
+      if (!isUuid(id)) return Promise.resolve(null);
+      return db
         .select()
         .from(goals)
         .where(eq(goals.id, id))
-        .then((rows) => rows[0] ?? null),
+        .then((rows) => rows[0] ?? null);
+    },
 
     getDefaultCompanyGoal: (companyId: string) => getDefaultCompanyGoal(db, companyId),
 
@@ -62,19 +69,23 @@ export function goalService(db: Db) {
         .returning()
         .then((rows) => rows[0]),
 
-    update: (id: string, data: Partial<typeof goals.$inferInsert>) =>
-      db
+    update: (id: string, data: Partial<typeof goals.$inferInsert>) => {
+      if (!isUuid(id)) return Promise.resolve(null);
+      return db
         .update(goals)
         .set({ ...data, updatedAt: new Date() })
         .where(eq(goals.id, id))
         .returning()
-        .then((rows) => rows[0] ?? null),
+        .then((rows) => rows[0] ?? null);
+    },
 
-    remove: (id: string) =>
-      db
+    remove: (id: string) => {
+      if (!isUuid(id)) return Promise.resolve(null);
+      return db
         .delete(goals)
         .where(eq(goals.id, id))
         .returning()
-        .then((rows) => rows[0] ?? null),
+        .then((rows) => rows[0] ?? null);
+    },
   };
 }

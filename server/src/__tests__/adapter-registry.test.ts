@@ -381,8 +381,52 @@ describe("server adapter registry", () => {
     expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
     const [patchedCtx] = hermesExecuteMock.mock.calls[0];
     expect(patchedCtx.config.hermesCommand).toBe("runtime-hermes");
-    expect(patchedCtx.agent.adapterConfig.hermesCommand).toBe("agent-hermes");
+    expect(patchedCtx.agent.adapterConfig.hermesCommand).toBe("runtime-hermes");
     expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
+  });
+
+  it("passes resolved runtime env strings to Hermes instead of persisted binding objects", async () => {
+    const adapter = requireServerAdapter("hermes_local");
+
+    await adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "Hermes Agent",
+        role: "ceo",
+        adapterType: "hermes_local",
+        adapterConfig: {
+          provider: "openai-codex",
+          env: {
+            HERMES_HOME: { type: "plain", value: "/Users/IA/.hermes" },
+          },
+        },
+      },
+      runtime: {},
+      config: {
+        provider: "openai-codex",
+        env: {
+          HERMES_HOME: "/Users/IA/.hermes",
+          GitHub_KEY: "resolved-gh-token",
+        },
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    expect(hermesExecuteMock).toHaveBeenCalledTimes(1);
+    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+    expect(patchedCtx.agent.adapterConfig.provider).toBe("openai-codex");
+    expect(patchedCtx.agent.adapterConfig.env.HERMES_HOME).toBe("/Users/IA/.hermes");
+    expect(patchedCtx.agent.adapterConfig.env.GitHub_KEY).toBe("resolved-gh-token");
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_KEY).toBe("agent-run-jwt");
+    expect(patchedCtx.agent.adapterConfig.env.HERMES_HOME).not.toEqual(
+      expect.objectContaining({ type: "plain" }),
+    );
   });
 
   it("passes the original Hermes context through when authToken is absent", async () => {

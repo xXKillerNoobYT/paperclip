@@ -1101,6 +1101,20 @@ export function authorizationService(db: Db) {
           explanation: "Allowed because the issue has no agent assignee.",
         });
       }
+      if (canCreateAgentsLegacy(actorAgent)) {
+        return allow({
+          action: input.action,
+          reason: "allow_legacy_agent_creator",
+          explanation: "Allowed by legacy agent creator authority to orchestrate same-company issues.",
+        });
+      }
+      if (await isManagerOf(companyId, actorAgentId, resource.assigneeAgentId)) {
+        return allow({
+          action: input.action,
+          reason: "allow_manager_chain",
+          explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
+        });
+      }
     }
     if (
       input.action === "agent_config:update" &&

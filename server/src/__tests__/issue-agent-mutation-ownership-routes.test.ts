@@ -608,6 +608,71 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
   });
 
+  it("allows a manager run to comment on another agent's same-company blocked issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked" }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts",
+      action: input.action,
+      reason: input.action === "tasks:manage_active_checkouts" ? "allow_manager_chain" : "allow_test_default",
+      explanation: "Allowed by test manager authority.",
+    }));
+
+    const app = await createApp(peerActor());
+    const res = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "OwnerRelay: move to todo." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "OwnerRelay: move to todo.",
+      expect.objectContaining({ agentId: peerAgentId, runId: "66666666-6666-4666-8666-666666666666" }),
+      expect.any(Object),
+    );
+  });
+
+  it("requires the manager run id before cross-issue manager comments", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked" }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts",
+      action: input.action,
+      reason: input.action === "tasks:manage_active_checkouts" ? "allow_manager_chain" : "allow_test_default",
+      explanation: "Allowed by test manager authority.",
+    }));
+
+    const app = await createApp(peerActor({ runId: undefined }));
+    const res = await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "OwnerRelay: move to todo." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(401);
+    expect(res.body.error).toBe("Agent run id required");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("allows a manager run to move and reassign another agent's same-company issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked" }));
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(peerAgentId) });
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed:
+        input.action === "issue:mutate" ||
+        input.action === "tasks:manage_active_checkouts" ||
+        input.action === "tasks:assign",
+      action: input.action,
+      reason: input.action === "tasks:manage_active_checkouts" ? "allow_manager_chain" : "allow_test_default",
+      explanation: "Allowed by test manager authority.",
+    }));
+
+    const app = await createApp(peerActor());
+    const res = await request(app).patch(`/api/issues/${issueId}`).send({
+      status: "todo",
+      assigneeAgentId: peerAgentId,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(issueId, expect.objectContaining({
+      status: "todo",
+      assigneeAgentId: peerAgentId,
+      actorAgentId: peerAgentId,
+    }));
+  });
+
   it("rejects the checked-out owner without a run id on attachment upload (401)", async () => {
     // Regression: an agent-authenticated client (e.g. the CLI's attachment:upload)
     // that fails to send X-Paperclip-Run-Id must be rejected — mutating your own

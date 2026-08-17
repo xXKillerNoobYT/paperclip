@@ -64,6 +64,12 @@ import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
+const PAPERCLIP_TIMESTAMP_DISPLAY_SESSION_ID_REGEX = /^\d{8}_\d{6}(?:_[A-Za-z0-9_-]*)?$/;
+
+function isPaperclipTimestampDisplaySessionId(sessionId: string) {
+  return PAPERCLIP_TIMESTAMP_DISPLAY_SESSION_ID_REGEX.test(sessionId);
+}
+
 interface ClaudeExecutionInput {
   runId: string;
   agent: AdapterExecutionContext["agent"];
@@ -591,7 +597,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const runtimeSessionParams = parseObject(runtime.sessionParams);
-  const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  const rawRuntimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+  const runtimeSessionId = isPaperclipTimestampDisplaySessionId(rawRuntimeSessionId)
+    ? ""
+    : rawRuntimeSessionId;
+  if (rawRuntimeSessionId && !runtimeSessionId) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude saved session "${rawRuntimeSessionId}" looks like a Paperclip display id, not a Claude session UUID/title. Starting a fresh Claude session.\n`,
+    );
+  }
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");

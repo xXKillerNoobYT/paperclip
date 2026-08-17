@@ -2815,6 +2815,8 @@ async function listIssueBlockedInboxAttentionMap(
             switch (finding.state) {
               case "blocked_by_unassigned_issue":
                 return "Assign blocker";
+              case "blocked_without_unblock_path":
+                return "Reconcile blocked status";
               case "blocked_by_assigned_backlog_issue":
                 return "Resume parked blocker";
               case "blocked_by_uninvokable_assignee":

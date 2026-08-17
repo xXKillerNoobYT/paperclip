@@ -128,6 +128,41 @@ function readRunIssueId(context: Record<string, unknown> | null) {
   return typeof nestedIssueId === "string" && isUuidLike(nestedIssueId) ? nestedIssueId : null;
 }
 
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+
+type IssueStatusLookup = {
+  getById: (id: string) => Promise<{ status?: string | null } | null | undefined>;
+};
+
+function isTerminalIssueStatus(status: unknown) {
+  return typeof status === "string" && TERMINAL_ISSUE_STATUSES.has(status);
+}
+
+async function filterTerminalIssueRuns<T extends { issueId?: string | null }>(
+  runs: T[],
+  issueSvc: IssueStatusLookup,
+) {
+  const issueIds = Array.from(new Set(
+    runs
+      .map((run) => run.issueId)
+      .filter((issueId): issueId is string => typeof issueId === "string" && isUuidLike(issueId)),
+  ));
+  if (issueIds.length === 0) return runs;
+
+  const statuses = new Map<string, string | null>();
+  await Promise.all(issueIds.map(async (issueId) => {
+    const issue = await issueSvc.getById(issueId);
+    statuses.set(issueId, issue?.status ?? null);
+  }));
+
+  return runs.filter((run) => {
+    const issueId = run.issueId;
+    if (typeof issueId !== "string" || !isUuidLike(issueId)) return true;
+    const status = statuses.get(issueId) ?? null;
+    return status !== null && !isTerminalIssueStatus(status);
+  });
+}
+
 export function agentRoutes(
   db: Db,
   options: { pluginWorkerManager?: PluginWorkerManager } = {},
@@ -3311,6 +3346,7 @@ export function agentRoutes(
     // padded in and renders bogus "live" counts.
     const minCount = readLiveRunsQueryInt(req.query.minCount, 50, 0);
     const limit = readLiveRunsQueryInt(req.query.limit, 50, 50);
+    const issueSvc = issueService(db);
 
     const columns = {
       id: heartbeatRuns.id,
@@ -3352,7 +3388,7 @@ export function agentRoutes(
       )
       .orderBy(desc(heartbeatRuns.createdAt));
 
-    const liveRuns = await liveRunsQuery.limit(limit);
+    const liveRuns = await filterTerminalIssueRuns(await liveRunsQuery.limit(limit), issueSvc);
     const targetRunCount = Math.min(minCount, limit);
 
     if (targetRunCount > 0 && liveRuns.length < targetRunCount) {
@@ -3371,7 +3407,8 @@ export function agentRoutes(
         .orderBy(desc(heartbeatRuns.createdAt))
         .limit(targetRunCount - liveRuns.length);
 
-      const rows = [...liveRuns, ...recentRuns];
+      const visibleRecentRuns = await filterTerminalIssueRuns(recentRuns, issueSvc);
+      const rows = [...liveRuns, ...visibleRecentRuns].slice(0, targetRunCount);
       res.json(await Promise.all(rows.map(async (run) => ({
         ...run,
         outputSilence: await heartbeat.buildRunOutputSilence(run),
@@ -3549,6 +3586,10 @@ export function agentRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    if (isTerminalIssueStatus(issue.status)) {
+      res.json([]);
+      return;
+    }
 
     const liveRuns = await db
       .select({
@@ -3582,7 +3623,7 @@ export function agentRoutes(
         and(
           eq(heartbeatRuns.companyId, issue.companyId),
           inArray(heartbeatRuns.status, ["queued", "running"]),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+          sql`(${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issue.id}`,
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt));
@@ -3603,6 +3644,10 @@ export function agentRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    if (isTerminalIssueStatus(issue.status)) {
+      res.json(null);
+      return;
+    }
 
     let run = issue.executionRunId ? await heartbeat.getRunIssueSummary(issue.executionRunId) : null;
     if (
