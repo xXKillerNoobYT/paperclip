@@ -264,6 +264,36 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Plugin may only use originKind values under plugin:paperclip.missions");
   });
 
+  it("does not let plugins opt into the recovery-only direct-child blocker exception", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const parentId = randomUUID();
+    const childId = randomUUID();
+    await db.insert(issues).values([
+      { id: parentId, companyId, title: "Parent", status: "todo", priority: "medium" },
+      { id: childId, companyId, parentId, title: "Child", status: "todo", priority: "medium" },
+    ]);
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId: parentId,
+        companyId,
+        patch: { blockedByIssueIds: [childId], allowDirectChildBlocker: true },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "invalid_blocker_relation",
+        reason: "descendant",
+        issueId: parentId,
+        blockerIssueId: childId,
+      },
+    });
+    await expect(services.issues.getRelations({ issueId: parentId, companyId })).resolves.toMatchObject({
+      blockedBy: [],
+    });
+  });
+
   it("creates plugin operation issues with the generic operation origin", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
