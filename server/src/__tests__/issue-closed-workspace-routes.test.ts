@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const closedWorkspaceId = "33333333-3333-4333-8333-333333333333";
@@ -190,7 +190,9 @@ function makeClosedWorkspace() {
 }
 
 describe.sequential("closed isolated workspace issue routes", () => {
-  beforeEach(() => {
+  let app: express.Express;
+
+  beforeAll(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -205,13 +207,17 @@ describe.sequential("closed isolated workspace issue routes", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerServiceMocks();
+    app = await createApp();
+  });
+
+  beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockExecutionWorkspaceService.getById.mockResolvedValue(makeClosedWorkspace());
   });
 
   it("rejects new issue comments when the linked isolated workspace is closed", async () => {
-    const res = await request(await createApp())
+    const res = await request(app)
       .post(`/api/issues/${issueId}/comments`)
       .send({ body: "hello" });
 
@@ -221,7 +227,7 @@ describe.sequential("closed isolated workspace issue routes", () => {
   });
 
   it("rejects comment updates when the linked isolated workspace is closed", async () => {
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${issueId}`)
       .send({ comment: "hello" });
 
@@ -232,7 +238,7 @@ describe.sequential("closed isolated workspace issue routes", () => {
   });
 
   it("rejects checkout when the linked isolated workspace is closed", async () => {
-    const res = await request(await createApp())
+    const res = await request(app)
       .post(`/api/issues/${issueId}/checkout`)
       .send({
         agentId,
@@ -250,7 +256,7 @@ describe.sequential("closed isolated workspace issue routes", () => {
       executionWorkspaceId: nextWorkspaceId,
     });
 
-    const res = await request(await createApp())
+    const res = await request(app)
       .patch(`/api/issues/${issueId}`)
       .send({ executionWorkspaceId: nextWorkspaceId });
 
