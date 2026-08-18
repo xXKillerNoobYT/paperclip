@@ -3621,6 +3621,35 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("rejects a parent move that would invalidate an existing direct blocker", async () => {
+    const companyId = randomUUID();
+    const rootId = randomUUID();
+    const parentId = randomUUID();
+    const subjectId = randomUUID();
+    const blockerId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: rootId, companyId, title: "Root", status: "todo", priority: "medium" },
+      { id: parentId, companyId, parentId: rootId, title: "Parent", status: "todo", priority: "medium" },
+      { id: subjectId, companyId, parentId, title: "Subject", status: "blocked", priority: "medium" },
+      { id: blockerId, companyId, title: "External blocker", status: "todo", priority: "medium" },
+    ]);
+
+    await svc.update(subjectId, { blockedByIssueIds: [blockerId] });
+    await expect(svc.update(parentId, { parentId: blockerId })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "invalid_blocker_relation", reason: "ancestor", issueId: subjectId, blockerIssueId: blockerId },
+    });
+    await expect(svc.getRelationSummaries(subjectId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: blockerId })],
+    });
+  });
+
   it("only returns dependents once every blocker is done", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();

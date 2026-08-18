@@ -4274,6 +4274,77 @@ export function issueService(db: Db) {
     }
   }
 
+  async function lockCompanyIssueHierarchy(
+    companyId: string,
+    dbOrTx: DbReader = db,
+  ) {
+    // Use the same ordered lock set for direct-blocker validation and parent
+    // moves. A hierarchy read alone is not a safe validation snapshot: a
+    // concurrent intermediate reparent can otherwise invalidate an accepted
+    // blocker relation before it is committed.
+    return await dbOrTx
+      .select({ id: issues.id, parentId: issues.parentId, status: issues.status })
+      .from(issues)
+      .where(eq(issues.companyId, companyId))
+      .orderBy(asc(issues.id))
+      .for("update");
+  }
+
+  function hierarchyBlockerReason(
+    parentIdByIssueId: Map<string, string | null>,
+    blockerIssueId: string,
+    blockedIssueId: string,
+  ): "self" | "ancestor" | "descendant" | null {
+    if (blockerIssueId === blockedIssueId) return "self";
+    const blockedAncestors = new Set<string>();
+    for (let currentId: string | null | undefined = parentIdByIssueId.get(blockedIssueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
+      if (blockedAncestors.has(currentId)) break;
+      blockedAncestors.add(currentId);
+      if (currentId === blockerIssueId) return "ancestor";
+    }
+    const blockerAncestors = new Set<string>();
+    for (let currentId: string | null | undefined = parentIdByIssueId.get(blockerIssueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
+      if (blockerAncestors.has(currentId)) break;
+      blockerAncestors.add(currentId);
+      // The direct child-to-parent recovery gate is internal and documented;
+      // deeper descendant blockers remain invalid.
+      if (currentId === blockedIssueId && parentIdByIssueId.get(blockerIssueId) !== blockedIssueId) return "descendant";
+    }
+    return null;
+  }
+
+  async function assertParentMovePreservesBlockerTopology(
+    companyId: string,
+    issueId: string,
+    nextParentId: string | null,
+    dbOrTx: DbReader = db,
+  ) {
+    const hierarchyIssues = await lockCompanyIssueHierarchy(companyId, dbOrTx);
+    const currentParentIdByIssueId = new Map(hierarchyIssues.map((row) => [row.id, row.parentId]));
+    const currentParentId = currentParentIdByIssueId.get(issueId);
+    if (currentParentId === undefined || currentParentId === nextParentId) return;
+
+    const nextParentIdByIssueId = new Map(currentParentIdByIssueId);
+    nextParentIdByIssueId.set(issueId, nextParentId);
+    const blockerRows = await dbOrTx
+      .select({ blockerIssueId: issueRelations.issueId, blockedIssueId: issueRelations.relatedIssueId })
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
+    for (const relation of blockerRows) {
+      if (
+        hierarchyBlockerReason(currentParentIdByIssueId, relation.blockerIssueId, relation.blockedIssueId) === null
+        && hierarchyBlockerReason(nextParentIdByIssueId, relation.blockerIssueId, relation.blockedIssueId) !== null
+      ) {
+        throw unprocessable("Parent move would create an invalid direct blocker relation", {
+          code: "invalid_blocker_relation",
+          reason: hierarchyBlockerReason(nextParentIdByIssueId, relation.blockerIssueId, relation.blockedIssueId),
+          issueId: relation.blockedIssueId,
+          blockerIssueId: relation.blockerIssueId,
+        });
+      }
+    }
+  }
+
   async function syncBlockedByIssueIds(
     issueId: string,
     companyId: string,
@@ -4285,31 +4356,14 @@ export function issueService(db: Db) {
     const deduped = [...new Set(blockedByIssueIds)];
 
     if (deduped.length > 0) {
-      const lockedIssueIds = [issueId, ...deduped].sort();
-      await dbOrTx.execute(
-        sql`SELECT ${issues.id} FROM ${issues}
-            WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, lockedIssueIds))}
-            ORDER BY ${issues.id}
-            FOR UPDATE`,
-      );
-      const [relatedIssues, hierarchyIssues] = await Promise.all([
-        dbOrTx
-          .select({ id: issues.id, status: issues.status })
-          .from(issues)
-          .where(and(eq(issues.companyId, companyId), inArray(issues.id, deduped))),
-        dbOrTx
-          .select({ id: issues.id, parentId: issues.parentId })
-          .from(issues)
-          .where(eq(issues.companyId, companyId)),
-      ]);
+      const hierarchyIssues = await lockCompanyIssueHierarchy(companyId, dbOrTx);
+      const relatedIssues = hierarchyIssues.filter((issue) => deduped.includes(issue.id));
       if (relatedIssues.length !== deduped.length) {
         throw unprocessable("Blocked-by issues must belong to the same company");
       }
 
-      const typedRelatedIssues = relatedIssues as Array<{ id: string; status: string }>;
-      const typedHierarchyIssues = hierarchyIssues as Array<{ id: string; parentId: string | null }>;
-      const parentIdByIssueId = new Map<string, string | null>(typedHierarchyIssues.map((row) => [row.id, row.parentId]));
-      const relatedIssueById = new Map<string, { id: string; status: string }>(typedRelatedIssues.map((row) => [row.id, row]));
+      const parentIdByIssueId = new Map<string, string | null>(hierarchyIssues.map((row) => [row.id, row.parentId]));
+      const relatedIssueById = new Map<string, { id: string; status: string }>(relatedIssues.map((row) => [row.id, row]));
       const relationError = (reason: "self" | "ancestor" | "descendant" | "done" | "cancelled", blockerIssueId: string) =>
         unprocessable(
           reason === "self"
@@ -6421,6 +6475,14 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (issueData.parentId !== undefined && issueData.parentId !== existing.parentId) {
+          await assertParentMovePreservesBlockerTopology(
+            existing.companyId,
+            id,
+            issueData.parentId ?? null,
+            tx,
+          );
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
