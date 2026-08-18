@@ -2768,14 +2768,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
     if (blockedByIssueIds.length === 0) return null;
 
-    const updated = await issuesSvc.update(issue.id, {
-      status: "blocked",
-      blockedByIssueIds,
-      // This recovery path converts only direct children into the parent's
-      // internal dependency wait; public issue mutations remain disallowed
-      // from adding hierarchical blockers.
-      allowDirectChildBlocker: true,
-    });
+    const updated = await issuesSvc.setRecoveryDependencyWait(issue.id, blockedByIssueIds);
     if (!updated) return null;
 
     const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);

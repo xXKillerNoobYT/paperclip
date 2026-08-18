@@ -2989,7 +2989,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
-  it("createChild applies parent defaults, acceptance criteria, workspace inheritance, and optional parent blocker chaining", async () => {
+  it("createChild applies parent defaults, acceptance criteria, and workspace inheritance", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const goalId = randomUUID();
@@ -3059,15 +3059,13 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       },
     });
 
-    const { issue: child, parentBlockerAdded } = await svc.createChild(parentIssueId, {
+    const { issue: child } = await svc.createChild(parentIssueId, {
       title: "Child helper",
       status: "todo",
       description: "Implement the helper.",
       acceptanceCriteria: ["Uses the parent issue as parentId", "Reuses the parent execution workspace"],
-      blockParentUntilDone: true,
     });
 
-    expect(parentBlockerAdded).toBe(true);
     expect(child.parentId).toBe(parentIssueId);
     expect(child.projectId).toBe(projectId);
     expect(child.goalId).toBe(goalId);
@@ -3078,13 +3076,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
     expect(child.executionWorkspacePreference).toBe("reuse_existing");
 
-    const parentRelations = await svc.getRelationSummaries(parentIssueId);
-    expect(parentRelations.blockedBy).toEqual([
-      expect.objectContaining({
-        id: child.id,
-        title: "Child helper",
-      }),
-    ]);
+    await expect(svc.getRelationSummaries(parentIssueId)).resolves.toMatchObject({ blockedBy: [] });
   });
 
   it("createChild preserves strategy-only workspace intent without realizing the parent workspace", async () => {
@@ -3451,7 +3443,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(child.blocks).toEqual([]);
   });
 
-  it("returns blocks summaries when child creation blocks the parent", async () => {
+  it("does not let stale generic child-create input block its parent", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -3474,15 +3466,11 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       status: "todo",
       priority: "medium",
       blockParentUntilDone: true,
-    });
+    } as any);
 
-    expect(child.blocks.map((relation) => relation.id)).toEqual([parentId]);
-    expect(child.blocks[0]).toEqual(expect.objectContaining({
-      title: "Parent",
-      status: "todo",
-      priority: "medium",
-    }));
+    expect(child.blocks).toEqual([]);
     expect(child.blockedBy).toEqual([]);
+    await expect(svc.getRelationSummaries(parentId)).resolves.toMatchObject({ blockedBy: [] });
   });
 
   it("adds terminal blockers to immediate blocked-by summaries", async () => {
@@ -3597,19 +3585,26 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       });
     }
 
-    // Only the internal review-recovery path may add a direct child blocker.
-    await svc.update(subjectId, {
+    // A stale or untyped caller cannot smuggle the retired generic bypass.
+    await expect(svc.update(subjectId, {
       blockedByIssueIds: [childId],
       allowDirectChildBlocker: true,
+    } as any)).rejects.toMatchObject({
+      status: 422,
+      details: { code: "invalid_blocker_relation", reason: "descendant", issueId: subjectId, blockerIssueId: childId },
     });
+    await expect(svc.getRelationSummaries(subjectId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: siblingId })],
+    });
+
+    // The server-owned recovery operation is the only structural capability
+    // that may turn a direct child into the parent's durable wait path.
+    await svc.setRecoveryDependencyWait(subjectId, [childId]);
     await expect(svc.getRelationSummaries(subjectId)).resolves.toMatchObject({
       blockedBy: [expect.objectContaining({ id: childId })],
     });
     await expect(
-      svc.update(subjectId, {
-        blockedByIssueIds: [grandchildId],
-        allowDirectChildBlocker: true,
-      }),
+      svc.setRecoveryDependencyWait(subjectId, [grandchildId]),
     ).rejects.toMatchObject({
       status: 422,
       details: { code: "invalid_blocker_relation", reason: "descendant", issueId: subjectId, blockerIssueId: grandchildId },
@@ -3648,6 +3643,85 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await expect(svc.getRelationSummaries(subjectId)).resolves.toMatchObject({
       blockedBy: [expect.objectContaining({ id: blockerId })],
     });
+  });
+
+  it("waits for a concurrent reparent before validating a blocker against the committed hierarchy", async () => {
+    const companyId = randomUUID();
+    const rootId = randomUUID();
+    const parentId = randomUUID();
+    const subjectId = randomUUID();
+    const blockerId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: rootId, companyId, title: "Root", status: "todo", priority: "medium" },
+      { id: parentId, companyId, parentId: rootId, title: "Parent", status: "todo", priority: "medium" },
+      { id: subjectId, companyId, parentId, title: "Subject", status: "blocked", priority: "medium" },
+      { id: blockerId, companyId, title: "Future ancestor", status: "todo", priority: "medium" },
+    ]);
+
+    const reparentDb = createDb(tempDb!.connectionString);
+    const blockerDb = createDb(tempDb!.connectionString);
+    const reparentReady = deferred<void>();
+    const releaseReparent = deferred<void>();
+
+    const reparentPromise = reparentDb.transaction(async (tx) => {
+      await issueService(reparentDb).update(parentId, { parentId: blockerId }, tx);
+      reparentReady.resolve();
+      await releaseReparent.promise;
+    });
+    await reparentReady.promise;
+
+    const blockerBackendReady = deferred<number>();
+    const blockerWriteResult = blockerDb.transaction(async (tx) => {
+      const rows = await tx.execute(sql<{ pid: number }>`select pg_backend_pid()::int as pid`);
+      blockerBackendReady.resolve(Number(rows[0]!.pid));
+      return issueService(blockerDb).update(subjectId, { blockedByIssueIds: [blockerId] }, tx);
+    }).then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
+
+    const blockerBackendPid = await blockerBackendReady.promise;
+    let observedLockWait = false;
+    try {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const rows = await db.execute(sql<{ waitEventType: string | null }>`
+          select wait_event_type as "waitEventType"
+          from pg_stat_activity
+          where pid = ${blockerBackendPid}
+        `);
+        if (rows[0]?.waitEventType === "Lock") {
+          observedLockWait = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      releaseReparent.resolve();
+    }
+
+    await reparentPromise;
+    const blockerResult = await blockerWriteResult;
+    expect(observedLockWait).toBe(true);
+    expect(blockerResult.status).toBe("rejected");
+    expect(blockerResult.status === "rejected" ? blockerResult.error : null).toMatchObject({
+      status: 422,
+      details: {
+        code: "invalid_blocker_relation",
+        reason: "ancestor",
+        issueId: subjectId,
+        blockerIssueId: blockerId,
+      },
+    });
+
+    const [committedParent] = await db.select({ parentId: issues.parentId }).from(issues).where(eq(issues.id, parentId));
+    expect(committedParent?.parentId).toBe(blockerId);
+    await expect(svc.getRelationSummaries(subjectId)).resolves.toMatchObject({ blockedBy: [] });
   });
 
   it("only returns dependents once every blocker is done", async () => {

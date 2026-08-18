@@ -34,9 +34,9 @@ function invalidEdges(
     if (!blocker || !blocked) return [];
     let reason: InvalidReason | null = null;
     if (blocker.id === blocked.id) reason = "self";
-    // `createChild({ blockParentUntilDone: true })` intentionally creates this
-    // child-to-parent gate. It is not a user-supplied hierarchy blocker and must
-    // survive repair so review/device/approval gates remain intact.
+    // The server-owned recovery lifecycle may create this direct child-to-parent
+    // gate. It is not a user-supplied hierarchy blocker and must survive repair
+    // so review/device/approval gates remain intact.
     else if (blocker.parentId === blocked.id) return [];
     else if (blocker.status === "done" || blocker.status === "cancelled") reason = blocker.status;
     else {

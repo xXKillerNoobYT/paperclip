@@ -578,10 +578,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
-  blockParentUntilDone?: boolean;
   executionWorkspaceInheritanceMode?: "linkage" | "strategy_only";
-  actorAgentId?: string | null;
-  actorUserId?: string | null;
 };
 type AcceptedPlanDecompositionInput = {
   acceptedPlanRevisionId: string;
@@ -4351,7 +4348,7 @@ export function issueService(db: Db) {
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
     dbOrTx: any = db,
-    options: { allowDirectChildBlocker?: boolean } = {},
+    directChildPolicy: "reject" | "allow_recovery_direct_child" = "reject",
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
 
@@ -4394,7 +4391,13 @@ export function issueService(db: Db) {
         for (let currentId: string | null | undefined = parentIdByIssueId.get(blockerIssueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
           if (blockerAncestors.has(currentId)) break;
           blockerAncestors.add(currentId);
-          if (currentId === issueId && !(options.allowDirectChildBlocker && parentIdByIssueId.get(blockerIssueId) === issueId)) {
+          if (
+            currentId === issueId
+            && !(
+              directChildPolicy === "allow_recovery_direct_child"
+              && parentIdByIssueId.get(blockerIssueId) === issueId
+            )
+          ) {
             throw relationError("descendant", blockerIssueId);
           }
         }
@@ -5740,12 +5743,12 @@ export function issueService(db: Db) {
 
       const {
         acceptanceCriteria,
-        blockParentUntilDone,
         executionWorkspaceInheritanceMode = "linkage",
-        actorAgentId,
-        actorUserId,
         ...issueData
       } = data;
+      // Older callers may still send the removed public flag at runtime. Keep
+      // it out of the insert without making it part of the service contract.
+      delete (issueData as Record<string, unknown>).blockParentUntilDone;
       const inheritStrategyOnly = executionWorkspaceInheritanceMode === "strategy_only";
       const hasExplicitExecutionWorkspaceOverride =
         issueData.executionWorkspaceId !== undefined ||
@@ -5755,7 +5758,7 @@ export function issueService(db: Db) {
         inheritStrategyOnly && !hasExplicitExecutionWorkspaceOverride
           ? buildPreRealizationExecutionWorkspaceSettings(parent.executionWorkspaceSettings)
           : null;
-      let child = await issueService(db).create(parent.companyId, {
+      const child = await issueService(db).create(parent.companyId, {
         ...issueData,
         parentId: parent.id,
         projectId: issueData.projectId ?? parent.projectId,
@@ -5775,26 +5778,7 @@ export function issueService(db: Db) {
           : { inheritExecutionWorkspaceFromIssueId: parent.id }),
       });
 
-      if (blockParentUntilDone) {
-        const existingBlockers = await db
-          .select({ blockerIssueId: issueRelations.issueId })
-          .from(issueRelations)
-          .where(and(eq(issueRelations.companyId, parent.companyId), eq(issueRelations.relatedIssueId, parent.id), eq(issueRelations.type, "blocks")));
-        await syncBlockedByIssueIds(
-          parent.id,
-          parent.companyId,
-          [...new Set([...existingBlockers.map((row) => row.blockerIssueId), child.id])],
-          { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
-          db,
-          { allowDirectChildBlocker: true },
-        );
-        [child] = await withIssueRelationSummaries(parent.companyId, [child], db);
-      }
-
-      return {
-        issue: child,
-        parentBlockerAdded: Boolean(blockParentUntilDone),
-      };
+      return { issue: child };
     },
 
     decomposeAcceptedPlan: async (
@@ -6331,7 +6315,6 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
-        allowDirectChildBlocker?: boolean;
       },
       dbOrTx: any = db,
     ) => {
@@ -6347,9 +6330,11 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
-        allowDirectChildBlocker,
         ...issueData
       } = data;
+      // Runtime hardening for stale/untyped callers: this removed flag cannot
+      // select the recovery-only blocker policy through generic updates.
+      delete (issueData as Record<string, unknown>).allowDirectChildBlocker;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -6522,7 +6507,6 @@ export function issueService(db: Db) {
               userId: actorUserId ?? null,
             },
             tx,
-            { allowDirectChildBlocker },
           );
         }
         if (
@@ -6581,6 +6565,24 @@ export function issueService(db: Db) {
 
       return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
     },
+
+    setRecoveryDependencyWait: async (
+      id: string,
+      blockedByIssueIds: string[],
+    ) => db.transaction(async (tx) => {
+      const updated = await issueService(db).update(id, { status: "blocked" }, tx);
+      if (!updated) return null;
+
+      await syncBlockedByIssueIds(
+        id,
+        updated.companyId,
+        blockedByIssueIds,
+        {},
+        tx,
+        "allow_recovery_direct_child",
+      );
+      return updated;
+    }),
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
       const rows = await db

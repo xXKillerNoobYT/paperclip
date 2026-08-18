@@ -4,6 +4,7 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -193,6 +194,7 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issueRelations);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
@@ -203,6 +205,30 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("does not create a parent blocker from ordinary child-create bypass payloads", async () => {
+    const company = await seedCompany(db, "Child create");
+    const project = await seedProject(db, company.id, "Core");
+    const parent = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Parent",
+      status: "todo",
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Ordinary child",
+        status: "todo",
+        blockParentUntilDone: true,
+        allowDirectChildBlocker: true,
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body).toMatchObject({ parentId: parent.id, title: "Ordinary child" });
+    await expect(db.select().from(issueRelations)).resolves.toEqual([]);
   });
 
   it("returns stale-blocker diagnosis and anomaly flags for a done blocker on a blocked issue", async () => {

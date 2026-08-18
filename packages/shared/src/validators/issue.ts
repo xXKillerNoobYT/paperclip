@@ -433,7 +433,6 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(createIssueBa
   })
   .extend({
     acceptanceCriteria: z.array(z.string().trim().min(1).max(500)).max(20).optional(),
-    blockParentUntilDone: z.boolean().optional().default(false),
   }));
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
