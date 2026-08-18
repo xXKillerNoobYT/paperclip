@@ -4274,17 +4274,25 @@ export function issueService(db: Db) {
     }
   }
 
+  async function lockIssueTopology(companyId: string, dbOrTx: any) {
+    // Direct-blocker validation reads the issue hierarchy. Serialize it with
+    // hierarchy moves in this service so a concurrent reparent cannot make a
+    // validated edge become an ancestor/descendant edge before it is stored.
+    await dbOrTx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${companyId}))`);
+  }
+
   async function syncBlockedByIssueIds(
     issueId: string,
     companyId: string,
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
     dbOrTx: any = db,
-    options: { allowDirectChildBlocker?: boolean } = {},
+    options: { allowDirectChildBlocker?: boolean; allowedDirectChildBlockerIds?: ReadonlySet<string> } = {},
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
 
     if (deduped.length > 0) {
+      await lockIssueTopology(companyId, dbOrTx);
       const lockedIssueIds = [issueId, ...deduped].sort();
       await dbOrTx.execute(
         sql`SELECT ${issues.id} FROM ${issues}
@@ -4340,7 +4348,9 @@ export function issueService(db: Db) {
         for (let currentId: string | null | undefined = parentIdByIssueId.get(blockerIssueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
           if (blockerAncestors.has(currentId)) break;
           blockerAncestors.add(currentId);
-          if (currentId === issueId && !(options.allowDirectChildBlocker && parentIdByIssueId.get(blockerIssueId) === issueId)) {
+          const allowsDirectChildBlocker =
+            options.allowDirectChildBlocker || options.allowedDirectChildBlockerIds?.has(blockerIssueId);
+          if (currentId === issueId && !(allowsDirectChildBlocker && parentIdByIssueId.get(blockerIssueId) === issueId)) {
             throw relationError("descendant", blockerIssueId);
           }
         }
@@ -6421,6 +6431,31 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        let existingDirectChildBlockersByDependent = new Map<string, Set<string>>();
+        if (issueData.parentId !== undefined) {
+          await lockIssueTopology(existing.companyId, tx);
+          const existingRelations = await tx
+            .select({
+              blockerIssueId: issueRelations.issueId,
+              blockedIssueId: issueRelations.relatedIssueId,
+              blockerParentId: issues.parentId,
+            })
+            .from(issueRelations)
+            .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+            .where(
+              and(
+                eq(issueRelations.companyId, existing.companyId),
+                eq(issueRelations.type, "blocks"),
+                or(eq(issueRelations.issueId, id), eq(issueRelations.relatedIssueId, id)),
+              ),
+            );
+          for (const relation of existingRelations) {
+            if (relation.blockerParentId !== relation.blockedIssueId) continue;
+            const blockerIds = existingDirectChildBlockersByDependent.get(relation.blockedIssueId) ?? new Set<string>();
+            blockerIds.add(relation.blockerIssueId);
+            existingDirectChildBlockersByDependent.set(relation.blockedIssueId, blockerIds);
+          }
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
@@ -6462,6 +6497,38 @@ export function issueService(db: Db) {
             tx,
             { allowDirectChildBlocker },
           );
+        }
+        if (issueData.parentId !== undefined) {
+          const affectedRelations: Array<{ blockedIssueId: string }> = await tx
+            .select({ blockedIssueId: issueRelations.relatedIssueId })
+            .from(issueRelations)
+            .where(
+              and(
+                eq(issueRelations.companyId, existing.companyId),
+                eq(issueRelations.type, "blocks"),
+                or(eq(issueRelations.issueId, id), eq(issueRelations.relatedIssueId, id)),
+              ),
+            );
+          for (const blockedIssueId of [...new Set(affectedRelations.map((relation) => relation.blockedIssueId))]) {
+            const currentBlockers: Array<{ blockerIssueId: string }> = await tx
+              .select({ blockerIssueId: issueRelations.issueId })
+              .from(issueRelations)
+              .where(
+                and(
+                  eq(issueRelations.companyId, existing.companyId),
+                  eq(issueRelations.type, "blocks"),
+                  eq(issueRelations.relatedIssueId, blockedIssueId),
+                ),
+              );
+            await syncBlockedByIssueIds(
+              blockedIssueId,
+              existing.companyId,
+              currentBlockers.map((relation) => relation.blockerIssueId),
+              {},
+              tx,
+              { allowedDirectChildBlockerIds: existingDirectChildBlockersByDependent.get(blockedIssueId) },
+            );
+          }
         }
         if (
           issueData.executionWorkspaceSettings !== undefined &&
