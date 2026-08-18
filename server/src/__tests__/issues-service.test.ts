@@ -3654,6 +3654,41 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("rejects a hierarchy move that invalidates a blocker relation owned by a descendant", async () => {
+    const companyId = randomUUID();
+    const rootId = randomUUID();
+    const subtreeId = randomUUID();
+    const subjectId = randomUUID();
+    const blockerId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: rootId, companyId, title: "Root", status: "todo", priority: "medium" },
+      { id: subtreeId, companyId, parentId: rootId, title: "Subtree", status: "todo", priority: "medium" },
+      { id: subjectId, companyId, parentId: subtreeId, title: "Subject", status: "blocked", priority: "medium" },
+      { id: blockerId, companyId, parentId: rootId, title: "Blocker", status: "todo", priority: "medium" },
+    ]);
+    await svc.update(subjectId, { blockedByIssueIds: [blockerId] });
+
+    await expect(svc.update(subtreeId, { parentId: blockerId })).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "invalid_blocker_relation",
+        reason: "ancestor",
+        issueId: subjectId,
+        blockerIssueId: blockerId,
+      },
+    });
+    await expect(svc.getById(subtreeId)).resolves.toMatchObject({ parentId: rootId });
+    await expect(svc.getRelationSummaries(subjectId)).resolves.toMatchObject({
+      blockedBy: [expect.objectContaining({ id: blockerId })],
+    });
+  });
+
   it("only returns dependents once every blocker is done", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();

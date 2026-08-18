@@ -6432,8 +6432,23 @@ export function issueService(db: Db) {
 
       const runUpdate = async (tx: any) => {
         let existingDirectChildBlockersByDependent = new Map<string, Set<string>>();
+        let movedSubtreeIssueIds = [id];
         if (issueData.parentId !== undefined) {
           await lockIssueTopology(existing.companyId, tx);
+          const hierarchyIssues: Array<{ id: string; parentId: string | null }> = await tx
+            .select({ id: issues.id, parentId: issues.parentId })
+            .from(issues)
+            .where(eq(issues.companyId, existing.companyId));
+          const parentIdByIssueId = new Map(hierarchyIssues.map((issue) => [issue.id, issue.parentId]));
+          movedSubtreeIssueIds = hierarchyIssues.flatMap((issue) => {
+            const ancestors = new Set<string>();
+            for (let currentId: string | null | undefined = issue.parentId; currentId; currentId = parentIdByIssueId.get(currentId)) {
+              if (ancestors.has(currentId)) break;
+              ancestors.add(currentId);
+              if (currentId === id) return [issue.id];
+            }
+            return issue.id === id ? [issue.id] : [];
+          });
           const existingRelations = await tx
             .select({
               blockerIssueId: issueRelations.issueId,
@@ -6446,7 +6461,10 @@ export function issueService(db: Db) {
               and(
                 eq(issueRelations.companyId, existing.companyId),
                 eq(issueRelations.type, "blocks"),
-                or(eq(issueRelations.issueId, id), eq(issueRelations.relatedIssueId, id)),
+                or(
+                  inArray(issueRelations.issueId, movedSubtreeIssueIds),
+                  inArray(issueRelations.relatedIssueId, movedSubtreeIssueIds),
+                ),
               ),
             );
           for (const relation of existingRelations) {
@@ -6506,7 +6524,10 @@ export function issueService(db: Db) {
               and(
                 eq(issueRelations.companyId, existing.companyId),
                 eq(issueRelations.type, "blocks"),
-                or(eq(issueRelations.issueId, id), eq(issueRelations.relatedIssueId, id)),
+                or(
+                  inArray(issueRelations.issueId, movedSubtreeIssueIds),
+                  inArray(issueRelations.relatedIssueId, movedSubtreeIssueIds),
+                ),
               ),
             );
           for (const blockedIssueId of [...new Set(affectedRelations.map((relation) => relation.blockedIssueId))]) {
