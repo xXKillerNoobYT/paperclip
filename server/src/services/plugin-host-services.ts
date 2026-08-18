@@ -1589,6 +1589,10 @@ export function buildHostServices(
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
+        // Direct-child blockers are a recovery-only lifecycle gate. Plugin
+        // patches are intentionally generic, so never let an untrusted plugin
+        // opt into that internal exception.
+        delete patch.allowDirectChildBlocker;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
