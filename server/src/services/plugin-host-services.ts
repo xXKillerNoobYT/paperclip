@@ -1589,6 +1589,10 @@ export function buildHostServices(
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
+        // This is an internal-only recovery capability. Plugins receive a
+        // generic patch object, so never forward an attempted capability
+        // grant into the issue service.
+        delete patch.allowDirectChildBlocker;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
