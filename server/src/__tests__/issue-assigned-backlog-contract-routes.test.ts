@@ -247,7 +247,7 @@ describe("assigned backlog creation contract", () => {
     );
   });
 
-  it("does not let a parent-blocking assigned child become an unwoken backlog leaf by default", async () => {
+  it("strips the retired parent-blocking flag from ordinary child creation", async () => {
     const res = await request(await createApp())
       .post("/api/issues/parent-1/children")
       .send({
@@ -268,10 +268,10 @@ describe("assigned backlog creation contract", () => {
       expect.objectContaining({
         title: "Assigned child blocker",
         assigneeAgentId,
-        blockParentUntilDone: true,
         status: "todo",
       }),
     );
+    expect(mockIssueService.createChild.mock.calls[0]?.[1]).not.toHaveProperty("blockParentUntilDone");
     expect(res.body).toEqual(expect.objectContaining({
       assigneeAgentId,
       parentId: "parent-1",
@@ -286,10 +286,10 @@ describe("assigned backlog creation contract", () => {
           statusDefaulted: true,
           statusDefaultReason: "assigned_omitted_status",
           assignmentWakeSkipped: false,
-          parentBlockerAdded: true,
         }),
       }),
     );
+    expect(mockLogActivity.mock.calls[0]?.[1]?.details).not.toHaveProperty("parentBlockerAdded");
     expect(mockWakeup).toHaveBeenCalledWith(
       assigneeAgentId,
       expect.objectContaining({

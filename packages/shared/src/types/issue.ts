@@ -160,7 +160,6 @@ export interface AcceptedPlanDecompositionChild {
   executionWorkspaceSettings?: IssueExecutionWorkspaceSettings | null;
   labelIds?: string[];
   acceptanceCriteria?: string[];
-  blockParentUntilDone?: boolean;
 }
 
 export interface AcceptedPlanDecomposition {

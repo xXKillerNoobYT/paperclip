@@ -578,10 +578,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
-  blockParentUntilDone?: boolean;
   executionWorkspaceInheritanceMode?: "linkage" | "strategy_only";
-  actorAgentId?: string | null;
-  actorUserId?: string | null;
 };
 type AcceptedPlanDecompositionInput = {
   acceptedPlanRevisionId: string;
@@ -4274,32 +4271,136 @@ export function issueService(db: Db) {
     }
   }
 
+  async function lockCompanyIssueHierarchy(
+    companyId: string,
+    dbOrTx: DbReader = db,
+  ) {
+    // Use the same ordered lock set for direct-blocker validation and parent
+    // moves. A hierarchy read alone is not a safe validation snapshot: a
+    // concurrent intermediate reparent can otherwise invalidate an accepted
+    // blocker relation before it is committed.
+    return await dbOrTx
+      .select({ id: issues.id, parentId: issues.parentId, status: issues.status })
+      .from(issues)
+      .where(eq(issues.companyId, companyId))
+      .orderBy(asc(issues.id))
+      .for("update");
+  }
+
+  function hierarchyBlockerReason(
+    parentIdByIssueId: Map<string, string | null>,
+    blockerIssueId: string,
+    blockedIssueId: string,
+  ): "self" | "ancestor" | "descendant" | null {
+    if (blockerIssueId === blockedIssueId) return "self";
+    const blockedAncestors = new Set<string>();
+    for (let currentId: string | null | undefined = parentIdByIssueId.get(blockedIssueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
+      if (blockedAncestors.has(currentId)) break;
+      blockedAncestors.add(currentId);
+      if (currentId === blockerIssueId) return "ancestor";
+    }
+    const blockerAncestors = new Set<string>();
+    for (let currentId: string | null | undefined = parentIdByIssueId.get(blockerIssueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
+      if (blockerAncestors.has(currentId)) break;
+      blockerAncestors.add(currentId);
+      // The direct child-to-parent recovery gate is internal and documented;
+      // deeper descendant blockers remain invalid.
+      if (currentId === blockedIssueId && parentIdByIssueId.get(blockerIssueId) !== blockedIssueId) return "descendant";
+    }
+    return null;
+  }
+
+  async function assertParentMovePreservesBlockerTopology(
+    companyId: string,
+    issueId: string,
+    nextParentId: string | null,
+    dbOrTx: DbReader = db,
+  ) {
+    const hierarchyIssues = await lockCompanyIssueHierarchy(companyId, dbOrTx);
+    const currentParentIdByIssueId = new Map(hierarchyIssues.map((row) => [row.id, row.parentId]));
+    const currentParentId = currentParentIdByIssueId.get(issueId);
+    if (currentParentId === undefined || currentParentId === nextParentId) return;
+
+    const nextParentIdByIssueId = new Map(currentParentIdByIssueId);
+    nextParentIdByIssueId.set(issueId, nextParentId);
+    const blockerRows = await dbOrTx
+      .select({ blockerIssueId: issueRelations.issueId, blockedIssueId: issueRelations.relatedIssueId })
+      .from(issueRelations)
+      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
+    for (const relation of blockerRows) {
+      if (
+        hierarchyBlockerReason(currentParentIdByIssueId, relation.blockerIssueId, relation.blockedIssueId) === null
+        && hierarchyBlockerReason(nextParentIdByIssueId, relation.blockerIssueId, relation.blockedIssueId) !== null
+      ) {
+        throw unprocessable("Parent move would create an invalid direct blocker relation", {
+          code: "invalid_blocker_relation",
+          reason: hierarchyBlockerReason(nextParentIdByIssueId, relation.blockerIssueId, relation.blockedIssueId),
+          issueId: relation.blockedIssueId,
+          blockerIssueId: relation.blockerIssueId,
+        });
+      }
+    }
+  }
+
   async function syncBlockedByIssueIds(
     issueId: string,
     companyId: string,
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
     dbOrTx: any = db,
+    directChildPolicy: "reject" | "allow_recovery_direct_child" = "reject",
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
-    if (deduped.some((candidate) => candidate === issueId)) {
-      throw unprocessable("Issue cannot be blocked by itself");
-    }
 
     if (deduped.length > 0) {
-      const lockedIssueIds = [issueId, ...deduped].sort();
-      await dbOrTx.execute(
-        sql`SELECT ${issues.id} FROM ${issues}
-            WHERE ${and(eq(issues.companyId, companyId), inArray(issues.id, lockedIssueIds))}
-            ORDER BY ${issues.id}
-            FOR UPDATE`,
-      );
-      const relatedIssues = await dbOrTx
-        .select({ id: issues.id })
-        .from(issues)
-        .where(and(eq(issues.companyId, companyId), inArray(issues.id, deduped)));
+      const hierarchyIssues = await lockCompanyIssueHierarchy(companyId, dbOrTx);
+      const relatedIssues = hierarchyIssues.filter((issue) => deduped.includes(issue.id));
       if (relatedIssues.length !== deduped.length) {
         throw unprocessable("Blocked-by issues must belong to the same company");
+      }
+
+      const parentIdByIssueId = new Map<string, string | null>(hierarchyIssues.map((row) => [row.id, row.parentId]));
+      const relatedIssueById = new Map<string, { id: string; status: string }>(relatedIssues.map((row) => [row.id, row]));
+      const relationError = (reason: "self" | "ancestor" | "descendant" | "done" | "cancelled", blockerIssueId: string) =>
+        unprocessable(
+          reason === "self"
+            ? "Issue cannot be blocked by itself"
+            : reason === "ancestor"
+              ? "Issue cannot be blocked by an ancestor"
+              : reason === "descendant"
+                ? "Issue cannot be blocked by a descendant"
+                : `Issue cannot be blocked by a ${reason} issue`,
+          { code: "invalid_blocker_relation", reason, issueId, blockerIssueId },
+        );
+
+      for (const blockerIssueId of deduped) {
+        if (blockerIssueId === issueId) throw relationError("self", blockerIssueId);
+        const blocker = relatedIssueById.get(blockerIssueId)!;
+        if (blocker.status === "done" || blocker.status === "cancelled") {
+          throw relationError(blocker.status, blockerIssueId);
+        }
+
+        const issueAncestors = new Set<string>();
+        for (let currentId: string | null | undefined = parentIdByIssueId.get(issueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
+          if (issueAncestors.has(currentId)) break;
+          issueAncestors.add(currentId);
+          if (currentId === blockerIssueId) throw relationError("ancestor", blockerIssueId);
+        }
+
+        const blockerAncestors = new Set<string>();
+        for (let currentId: string | null | undefined = parentIdByIssueId.get(blockerIssueId); currentId; currentId = parentIdByIssueId.get(currentId)) {
+          if (blockerAncestors.has(currentId)) break;
+          blockerAncestors.add(currentId);
+          if (
+            currentId === issueId
+            && !(
+              directChildPolicy === "allow_recovery_direct_child"
+              && parentIdByIssueId.get(blockerIssueId) === issueId
+            )
+          ) {
+            throw relationError("descendant", blockerIssueId);
+          }
+        }
       }
       await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
     }
@@ -5642,12 +5743,12 @@ export function issueService(db: Db) {
 
       const {
         acceptanceCriteria,
-        blockParentUntilDone,
         executionWorkspaceInheritanceMode = "linkage",
-        actorAgentId,
-        actorUserId,
         ...issueData
       } = data;
+      // Older callers may still send the removed public flag at runtime. Keep
+      // it out of the insert without making it part of the service contract.
+      delete (issueData as Record<string, unknown>).blockParentUntilDone;
       const inheritStrategyOnly = executionWorkspaceInheritanceMode === "strategy_only";
       const hasExplicitExecutionWorkspaceOverride =
         issueData.executionWorkspaceId !== undefined ||
@@ -5657,7 +5758,7 @@ export function issueService(db: Db) {
         inheritStrategyOnly && !hasExplicitExecutionWorkspaceOverride
           ? buildPreRealizationExecutionWorkspaceSettings(parent.executionWorkspaceSettings)
           : null;
-      let child = await issueService(db).create(parent.companyId, {
+      const child = await issueService(db).create(parent.companyId, {
         ...issueData,
         parentId: parent.id,
         projectId: issueData.projectId ?? parent.projectId,
@@ -5677,24 +5778,7 @@ export function issueService(db: Db) {
           : { inheritExecutionWorkspaceFromIssueId: parent.id }),
       });
 
-      if (blockParentUntilDone) {
-        const existingBlockers = await db
-          .select({ blockerIssueId: issueRelations.issueId })
-          .from(issueRelations)
-          .where(and(eq(issueRelations.companyId, parent.companyId), eq(issueRelations.relatedIssueId, parent.id), eq(issueRelations.type, "blocks")));
-        await syncBlockedByIssueIds(
-          parent.id,
-          parent.companyId,
-          [...new Set([...existingBlockers.map((row) => row.blockerIssueId), child.id])],
-          { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
-        );
-        [child] = await withIssueRelationSummaries(parent.companyId, [child], db);
-      }
-
-      return {
-        issue: child,
-        parentBlockerAdded: Boolean(blockParentUntilDone),
-      };
+      return { issue: child };
     },
 
     decomposeAcceptedPlan: async (
@@ -6248,6 +6332,9 @@ export function issueService(db: Db) {
         actorUserId,
         ...issueData
       } = data;
+      // Runtime hardening for stale/untyped callers: this removed flag cannot
+      // select the recovery-only blocker policy through generic updates.
+      delete (issueData as Record<string, unknown>).allowDirectChildBlocker;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -6373,6 +6460,14 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        if (issueData.parentId !== undefined && issueData.parentId !== existing.parentId) {
+          await assertParentMovePreservesBlockerTopology(
+            existing.companyId,
+            id,
+            issueData.parentId ?? null,
+            tx,
+          );
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
@@ -6470,6 +6565,24 @@ export function issueService(db: Db) {
 
       return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
     },
+
+    setRecoveryDependencyWait: async (
+      id: string,
+      blockedByIssueIds: string[],
+    ) => db.transaction(async (tx) => {
+      const updated = await issueService(db).update(id, { status: "blocked" }, tx);
+      if (!updated) return null;
+
+      await syncBlockedByIssueIds(
+        id,
+        updated.companyId,
+        blockedByIssueIds,
+        {},
+        tx,
+        "allow_recovery_direct_child",
+      );
+      return updated;
+    }),
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {
       const rows = await db

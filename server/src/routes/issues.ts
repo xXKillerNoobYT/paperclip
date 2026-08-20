@@ -7075,7 +7075,7 @@ export function issueRoutes(
       projectId: createBody.projectId ?? parent.projectId ?? null,
       executionPolicy,
     }, actor);
-    const { issue, parentBlockerAdded } = await svc.createChild(parent.id, {
+    const { issue } = await svc.createChild(parent.id, {
       ...createBody,
       ...(taskBridgeOriginForActor(req) ?? {}),
       id: issueId,
@@ -7092,8 +7092,6 @@ export function issueRoutes(
       actorRunId: actor.runId,
       actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
       trustExplicitResponsibleUserId: actor.actorType === "user",
-      actorAgentId: actor.agentId,
-      actorUserId: actor.actorType === "user" ? actor.actorId : null,
       watchdogActorRunId: actor.runId,
     });
     await externalObjectsSvc.syncIssueSafely(issue.id);
@@ -7114,7 +7112,6 @@ export function issueRoutes(
         ...buildCreateIssueActivityStatusDetails(issue, res),
         inheritedExecutionWorkspaceFromIssueId: parent.id,
         ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
-        ...(parentBlockerAdded ? { parentBlockerAdded: true } : {}),
         ...(serializationContext
           ? {
             watchdogFollowUpsSerialized: true,
