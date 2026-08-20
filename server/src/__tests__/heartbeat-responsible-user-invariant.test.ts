@@ -77,6 +77,23 @@ async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
   }
 }
 
+async function deleteAgentsAfterRuntimeState(db: ReturnType<typeof createDb>) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await db.delete(agentRuntimeState);
+    try {
+      await db.delete(agents);
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt < 4 && message.includes("agent_runtime_state_agent_id_agents_id_fk")) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
@@ -106,7 +123,7 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(issues);
-    await db.delete(agents);
+    await deleteAgentsAfterRuntimeState(db);
     await db.delete(companySkills);
     await db.delete(companyMemberships);
     await db.delete(companies);

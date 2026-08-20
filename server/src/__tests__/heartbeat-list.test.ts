@@ -33,7 +33,7 @@ describeEmbeddedPostgres("heartbeat list", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  });
+  }, 30_000);
 
   it("returns runs even when the linked db schema lacks processGroupId", async () => {
     const companyId = randomUUID();
