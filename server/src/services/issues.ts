@@ -104,6 +104,7 @@ import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recover
 import { visibleIssueCondition } from "./issue-visibility.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
@@ -4274,12 +4275,66 @@ export function issueService(db: Db) {
     }
   }
 
+  async function assertNoAncestorDescendantBlockers(
+    companyId: string,
+    issueId: string,
+    blockerIssueIds: string[],
+    options: { allowDirectChildToParent?: boolean } = {},
+    dbOrTx: Pick<Db, "select" | "execute"> = db,
+  ) {
+    if (blockerIssueIds.length === 0) return;
+
+    const issueRows: Array<{ id: string; parentId: string | null }> = await dbOrTx
+      .select({ id: issues.id, parentId: issues.parentId })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, [issueId, ...blockerIssueIds])));
+    const parentIdByIssueId = new Map(issueRows.map((row) => [row.id, row.parentId]));
+
+    const hierarchyRows: Array<{ issueId: string; ancestorId: string }> = await dbOrTx.execute(sql<{ issueId: string; ancestorId: string }>`
+      WITH RECURSIVE issue_ancestors AS (
+        SELECT id AS issue_id, parent_id AS ancestor_id
+        FROM ${issues}
+        WHERE ${issues.companyId} = ${companyId}
+          AND ${inArray(issues.id, [issueId, ...blockerIssueIds])}
+        UNION ALL
+        SELECT issue_ancestors.issue_id, ancestor.parent_id AS ancestor_id
+        FROM issue_ancestors
+        INNER JOIN ${issues} AS ancestor ON ancestor.id = issue_ancestors.ancestor_id
+        WHERE ancestor.company_id = ${companyId}
+          AND issue_ancestors.ancestor_id IS NOT NULL
+      )
+      SELECT issue_id AS "issueId", ancestor_id AS "ancestorId"
+      FROM issue_ancestors
+      WHERE ancestor_id IS NOT NULL
+    `);
+    const ancestorIdsByIssueId = new Map<string, Set<string>>();
+    for (const row of hierarchyRows) {
+      const ancestors = ancestorIdsByIssueId.get(row.issueId) ?? new Set<string>();
+      ancestors.add(row.ancestorId);
+      ancestorIdsByIssueId.set(row.issueId, ancestors);
+    }
+
+    for (const blockerIssueId of blockerIssueIds) {
+      const directChildToParent = parentIdByIssueId.get(blockerIssueId) === issueId;
+      if (options.allowDirectChildToParent && directChildToParent) continue;
+      if (
+        ancestorIdsByIssueId.get(issueId)?.has(blockerIssueId) ||
+        ancestorIdsByIssueId.get(blockerIssueId)?.has(issueId)
+      ) {
+        throw unprocessable(
+          "Blocking relations cannot connect ancestor and descendant issues; use createChild({ blockParentUntilDone: true }) for the explicit direct child-to-parent workflow",
+        );
+      }
+    }
+  }
+
   async function syncBlockedByIssueIds(
     issueId: string,
     companyId: string,
     blockedByIssueIds: string[],
     actor: { agentId?: string | null; userId?: string | null } = {},
     dbOrTx: any = db,
+    options: { allowDirectChildToParent?: boolean } = {},
   ) {
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
@@ -4294,14 +4349,42 @@ export function issueService(db: Db) {
             ORDER BY ${issues.id}
             FOR UPDATE`,
       );
-      const relatedIssues = await dbOrTx
-        .select({ id: issues.id })
+      const relatedIssues: Array<{ id: string; status: string }> = await dbOrTx
+        .select({ id: issues.id, status: issues.status })
         .from(issues)
         .where(and(eq(issues.companyId, companyId), inArray(issues.id, deduped)));
       if (relatedIssues.length !== deduped.length) {
         throw unprocessable("Blocked-by issues must belong to the same company");
       }
-      await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
+      const liveBlockerIssueIds = relatedIssues
+        .filter((relatedIssue) => !TERMINAL_ISSUE_STATUSES.has(relatedIssue.status))
+        .map((relatedIssue) => relatedIssue.id);
+      await assertNoBlockingCycles(companyId, issueId, liveBlockerIssueIds, dbOrTx);
+      await assertNoAncestorDescendantBlockers(companyId, issueId, liveBlockerIssueIds, options, dbOrTx);
+
+      await dbOrTx
+        .delete(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.relatedIssueId, issueId),
+            eq(issueRelations.type, "blocks"),
+          ),
+        );
+
+      if (liveBlockerIssueIds.length === 0) return;
+
+      await dbOrTx.insert(issueRelations).values(
+        liveBlockerIssueIds.map((blockerIssueId) => ({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: issueId,
+          type: "blocks",
+          createdByAgentId: actor.agentId ?? null,
+          createdByUserId: actor.userId ?? null,
+        })),
+      );
+      return;
     }
 
     await dbOrTx
@@ -5678,6 +5761,9 @@ export function issueService(db: Db) {
       });
 
       if (blockParentUntilDone) {
+        // This helper is the only permitted hierarchy blocker workflow: a newly
+        // created direct child may block its direct parent. Generic
+        // blockedByIssueIds mutations reject every ancestor/descendant pairing.
         const existingBlockers = await db
           .select({ blockerIssueId: issueRelations.issueId })
           .from(issueRelations)
@@ -5687,6 +5773,8 @@ export function issueService(db: Db) {
           parent.companyId,
           [...new Set([...existingBlockers.map((row) => row.blockerIssueId), child.id])],
           { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+          db,
+          { allowDirectChildToParent: true },
         );
         [child] = await withIssueRelationSummaries(parent.companyId, [child], db);
       }

@@ -3376,6 +3376,67 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(blockedRelations.blockedBy.map((relation) => relation.id)).toEqual([blockerId]);
   });
 
+  it("atomically removes terminal blockers and reads back only requested live blockers", async () => {
+    const companyId = randomUUID();
+    const doneBlockerId = randomUUID();
+    const cancelledBlockerId = randomUUID();
+    const liveBlockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: doneBlockerId, companyId, title: "Done blocker", status: "done", priority: "medium" },
+      { id: cancelledBlockerId, companyId, title: "Cancelled blocker", status: "cancelled", priority: "medium" },
+      { id: liveBlockerId, companyId, title: "Live blocker", status: "todo", priority: "medium" },
+      { id: blockedId, companyId, title: "Blocked issue", status: "blocked", priority: "medium" },
+    ]);
+
+    await svc.update(blockedId, {
+      blockedByIssueIds: [doneBlockerId, cancelledBlockerId, liveBlockerId],
+    });
+
+    expect((await svc.getRelationSummaries(blockedId)).blockedBy.map((relation) => relation.id)).toEqual([liveBlockerId]);
+  });
+
+  it("rejects generic blocker links between non-direct ancestors and descendants without replacing existing blockers", async () => {
+    const companyId = randomUUID();
+    const rootId = randomUUID();
+    const childId = randomUUID();
+    const grandchildId = randomUUID();
+    const rootExistingBlockerId = randomUUID();
+    const grandchildExistingBlockerId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: rootId, companyId, title: "Root", status: "todo", priority: "medium" },
+      { id: childId, companyId, parentId: rootId, title: "Child", status: "todo", priority: "medium" },
+      { id: grandchildId, companyId, parentId: childId, title: "Grandchild", status: "todo", priority: "medium" },
+      { id: rootExistingBlockerId, companyId, title: "Root existing blocker", status: "todo", priority: "medium" },
+      { id: grandchildExistingBlockerId, companyId, title: "Grandchild existing blocker", status: "todo", priority: "medium" },
+    ]);
+
+    await svc.update(rootId, { blockedByIssueIds: [rootExistingBlockerId] });
+    await svc.update(grandchildId, { blockedByIssueIds: [grandchildExistingBlockerId] });
+
+    const expectedError = {
+      status: 422,
+      message: "Blocking relations cannot connect ancestor and descendant issues; use createChild({ blockParentUntilDone: true }) for the explicit direct child-to-parent workflow",
+    };
+    await expect(svc.update(rootId, { blockedByIssueIds: [grandchildId] })).rejects.toMatchObject(expectedError);
+    expect((await svc.getRelationSummaries(rootId)).blockedBy.map((relation) => relation.id)).toEqual([rootExistingBlockerId]);
+
+    await expect(svc.update(grandchildId, { blockedByIssueIds: [rootId] })).rejects.toMatchObject(expectedError);
+    expect((await svc.getRelationSummaries(grandchildId)).blockedBy.map((relation) => relation.id)).toEqual([grandchildExistingBlockerId]);
+  });
+
   it("returns blocked-by summaries on newly created issues", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
