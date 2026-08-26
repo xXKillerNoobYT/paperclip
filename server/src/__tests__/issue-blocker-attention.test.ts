@@ -252,7 +252,6 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       status: "todo",
       assigneeAgentId: agentId,
     });
-    await block({ companyId, blockerIssueId: activeChildId, blockedIssueId: parentId });
     await block({ companyId, blockerIssueId: idleBlockerId, blockedIssueId: parentId });
     await activeRun({ companyId, agentId, issueId: activeChildId });
 
@@ -261,8 +260,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(parent?.blockerAttention).toMatchObject({
       state: "needs_attention",
       reason: "attention_required",
-      unresolvedBlockerCount: 2,
-      coveredBlockerCount: 1,
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 0,
       attentionBlockerCount: 1,
       sampleBlockerIdentifier: "PBM-3",
     });

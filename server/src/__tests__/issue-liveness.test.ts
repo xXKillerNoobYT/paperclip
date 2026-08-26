@@ -99,6 +99,44 @@ describe("issue graph liveness classifier", () => {
     expect(findings).toEqual([]);
   });
 
+  it("keeps a real first-class blocker visible when aggregate child work is also active", () => {
+    const childId = "aggregate-child-2";
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: childId,
+          identifier: "PAP-1704",
+          title: "Active child work",
+          status: "todo",
+          parentId: blockedId,
+          assigneeAgentId: "child-agent",
+        }),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1705",
+          title: "Unassigned dependency",
+          status: "todo",
+          assigneeAgentId: null,
+        }),
+      ],
+      relations: blocks,
+      agents: [agent(), manager, agent({ id: "child-agent", name: "Child Agent", reportsTo: managerId })],
+      activeRuns: [{ companyId, issueId: childId, agentId: "child-agent", status: "running" }],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: blockedId,
+      state: "blocked_by_unassigned_issue",
+      recoveryIssueId: blockerId,
+      dependencyPath: [
+        expect.objectContaining({ issueId: blockedId }),
+        expect.objectContaining({ issueId: blockerId }),
+      ],
+    });
+  });
+
   it("detects a PAP-1703-style blocked chain with an unassigned blocker and stable incident key", () => {
     const findings = classifyIssueGraphLiveness({
       issues: [

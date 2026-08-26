@@ -2809,6 +2809,28 @@ async function listIssueBlockedInboxAttentionMap(
       continue;
     }
 
+    // A named external owner/action is a real waiting path, but its details must
+    // remain redacted from the blocked-inbox projection. Evaluate it before the
+    // generic graph finding so the public response cannot bypass redaction.
+    const hasMonitor = Boolean(row.monitorNextCheckAt && row.monitorNextCheckAt.getTime() > Date.now());
+    const external = row.status === "blocked" && !hasMonitor ? externalWaitFromDescription(row.description) : null;
+    if (external) {
+      result.set(row.id, attentionBase({
+        state: "external_wait",
+        reason: "external_owner_action",
+        severity: "medium",
+        stoppedSinceAt: row.updatedAt,
+        owner: { type: "external", agentId: null, userId: null, label: null },
+        action: {
+          label: "External owner action",
+          detail: null,
+        },
+        sourceIssue: source,
+        externalDetailsRedacted: true,
+      }));
+      continue;
+    }
+
     const finding = findingByIssueId.get(row.id);
     if (finding) {
       const leaf = finding.dependencyPath.length > 1
@@ -2856,25 +2878,6 @@ async function listIssueBlockedInboxAttentionMap(
         leafIssue: issueRef(leaf),
         recoveryIssue: issueRef(issuesById.get(finding.recoveryIssueId)),
         sampleIssueIdentifier: leaf?.identifier ?? finding.identifier,
-      }));
-      continue;
-    }
-
-    const hasMonitor = Boolean(row.monitorNextCheckAt && row.monitorNextCheckAt.getTime() > Date.now());
-    const external = row.status === "blocked" && !hasMonitor ? externalWaitFromDescription(row.description) : null;
-    if (external) {
-      result.set(row.id, attentionBase({
-        state: "external_wait",
-        reason: "external_owner_action",
-        severity: "medium",
-        stoppedSinceAt: row.updatedAt,
-        owner: { type: "external", agentId: null, userId: null, label: null },
-        action: {
-          label: "External owner action",
-          detail: null,
-        },
-        sourceIssue: source,
-        externalDetailsRedacted: true,
       }));
       continue;
     }
