@@ -127,6 +127,7 @@ export function IssueBlockedNotice({
   if (issueStatus === "done" || issueStatus === "cancelled") return null;
   const showSuccessfulRunHandoff = successfulRunHandoff?.required === true;
   if (!showSuccessfulRunHandoff && blockers.length === 0 && issueStatus !== "blocked") return null;
+  const isAggregateChildCoverage = blockers.length === 0 && blockerAttention?.reason === "active_child";
   const successfulRunRetryNow = showSuccessfulRunHandoff
     && issueId
     && scheduledRetry?.status === "scheduled_retry"
@@ -264,7 +265,9 @@ export function IssueBlockedNotice({
                       ? <>Work on this task is blocked by {blockerLabel}, but the chain is stalled in review without a clear next step. Resolve the stalled reviews below or remove them as blockers.</>
                       : <>Work on this task is blocked by {blockerLabel}, but the chain is stalled in review without a clear next step. Resolve the stalled review below or remove it as a blocker.</>
                     : <>Work on this task is blocked by {blockerLabel} until {blockers.length === 1 ? "it is" : "they are"} complete. Comments still wake the assignee for questions or triage.</>
-                  : <>Work on this task is blocked until it is moved back to todo. Comments still wake the assignee for questions or triage.</>}
+                  : isAggregateChildCoverage
+                    ? <>Active sub-task work is in progress. This aggregate task has no direct blocker.</>
+                    : <>Work on this task is blocked until it is moved back to todo. Comments still wake the assignee for questions or triage.</>}
               </p>
               {blockers.length > 0 ? (
                 <div className="flex flex-wrap gap-1.5">

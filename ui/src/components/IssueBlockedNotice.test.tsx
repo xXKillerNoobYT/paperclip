@@ -223,6 +223,30 @@ describe("IssueBlockedNotice", () => {
     expect(node.textContent).toBe("");
   });
 
+  it("distinguishes aggregate child coverage from a blockerless blocked task", () => {
+    const node = render(
+      <IssueBlockedNotice
+        issueStatus="blocked"
+        blockers={[]}
+        blockerAttention={{
+          state: "covered",
+          reason: "active_child",
+          unresolvedBlockerCount: 0,
+          coveredBlockerCount: 0,
+          stalledBlockerCount: 0,
+          attentionBlockerCount: 0,
+          activeChildCount: 1,
+          sampleBlockerIdentifier: null,
+          sampleStalledBlockerIdentifier: null,
+        }}
+      />,
+    );
+
+    expect(node.textContent).toContain("Active sub-task work is in progress.");
+    expect(node.textContent).toContain("This aggregate task has no direct blocker.");
+    expect(node.textContent).not.toContain("moved back to todo");
+  });
+
   it("renders a recovery indicator on a blocker chip when the blocker has an active recovery action", () => {
     const node = render(
       <IssueBlockedNotice
