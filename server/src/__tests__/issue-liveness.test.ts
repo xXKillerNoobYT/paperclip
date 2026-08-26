@@ -77,6 +77,28 @@ describe("issue graph liveness classifier", () => {
     expect(findings).toEqual([]);
   });
 
+  it("treats a blocked aggregate parent with an active child as live without inventing a blocker edge", () => {
+    const childId = "aggregate-child-1";
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: childId,
+          identifier: "PAP-1704",
+          title: "Active child work",
+          status: "todo",
+          parentId: blockedId,
+          assigneeAgentId: "child-agent",
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager, agent({ id: "child-agent", name: "Child Agent", reportsTo: managerId })],
+      activeRuns: [{ companyId, issueId: childId, agentId: "child-agent", status: "running" }],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
   it("detects a PAP-1703-style blocked chain with an unassigned blocker and stable incident key", () => {
     const findings = classifyIssueGraphLiveness({
       issues: [

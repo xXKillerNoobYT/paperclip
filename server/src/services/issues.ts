@@ -1303,6 +1303,7 @@ function createIssueBlockerAttention(input: Partial<IssueBlockerAttention> = {})
     coveredBlockerCount: input.coveredBlockerCount ?? 0,
     stalledBlockerCount: input.stalledBlockerCount ?? 0,
     attentionBlockerCount: input.attentionBlockerCount ?? 0,
+    activeChildCount: input.activeChildCount ?? 0,
     sampleBlockerIdentifier: input.sampleBlockerIdentifier ?? null,
     sampleStalledBlockerIdentifier: input.sampleStalledBlockerIdentifier ?? null,
   };
@@ -1554,6 +1555,7 @@ async function listIssueBlockerAttentionMap(
 
   const nodesById = new Map<string, IssueBlockerAttentionNode>();
   const edgesByIssueId = new Map<string, IssueBlockerAttentionEdge[]>();
+  const aggregateChildrenByParentId = new Map<string, IssueBlockerAttentionNode[]>();
   for (const root of roots) nodesById.set(root.id, { ...root });
 
   let frontier = roots.map((root) => root.id);
@@ -1614,14 +1616,12 @@ async function listIssueBlockerAttentionMap(
         childRowsPromise,
       ]);
 
-      appendBlockerAttentionEdges(edgesByIssueId, [
-        ...explicitBlockerRows
+      appendBlockerAttentionEdges(
+        edgesByIssueId,
+        explicitBlockerRows
           .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
           .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
-        ...childRows
-          .filter((row): row is IssueBlockerAttentionQueryRow & { issueId: string } => row.issueId !== null)
-          .map((row) => ({ issueId: row.issueId, blockerIssueId: row.blockerIssueId })),
-      ]);
+      );
 
       for (const row of [...explicitBlockerRows, ...childRows]) {
         if (!row.issueId || nodesById.has(row.blockerIssueId)) continue;
@@ -1637,6 +1637,17 @@ async function listIssueBlockerAttentionMap(
           assigneeUserId: row.assigneeUserId,
         });
         nextFrontier.add(row.blockerIssueId);
+      }
+
+      for (const row of childRows) {
+        if (!row.issueId) continue;
+        const child = nodesById.get(row.blockerIssueId);
+        if (!child) continue;
+        const children = aggregateChildrenByParentId.get(row.issueId) ?? [];
+        if (!children.some((candidate) => candidate.id === child.id)) {
+          children.push(child);
+          aggregateChildrenByParentId.set(row.issueId, children);
+        }
       }
     }
 
@@ -1867,6 +1878,16 @@ async function listIssueBlockerAttentionMap(
   for (const root of roots) {
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
     if (topLevelEdges.length === 0) {
+      const activeChildren = (aggregateChildrenByParentId.get(root.id) ?? [])
+        .filter((child) => activeIssueIds.has(child.id));
+      if (activeChildren.length > 0) {
+        attentionMap.set(root.id, createIssueBlockerAttention({
+          state: "covered",
+          reason: "active_child",
+          activeChildCount: activeChildren.length,
+        }));
+        continue;
+      }
       attentionMap.set(root.id, createIssueBlockerAttention({
         state: "needs_attention",
         reason: "attention_required",

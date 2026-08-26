@@ -228,6 +228,8 @@ export interface IssueBlockerAttention {
   coveredBlockerCount: number;
   stalledBlockerCount: number;
   attentionBlockerCount: number;
+  /** Active child execution covers aggregate work; it is never a blocker edge. */
+  activeChildCount?: number;
   sampleBlockerIdentifier: string | null;
   sampleStalledBlockerIdentifier: string | null;
 }

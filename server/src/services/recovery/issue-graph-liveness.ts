@@ -409,6 +409,16 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues);
   }
 
+  function hasActiveAggregateChildExecutionPath(issue: IssueLivenessIssueInput) {
+    return input.issues.some((child) =>
+      child.companyId === issue.companyId &&
+      child.parentId === issue.id &&
+      child.status !== "done" &&
+      child.status !== "cancelled" &&
+      hasActiveExecutionPath(child.companyId, child.id, activeRuns, queuedWakeRequests),
+    );
+  }
+
   function reviewFinding(
     source: IssueLivenessIssueInput,
     reviewIssue: IssueLivenessIssueInput,
@@ -614,6 +624,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       if (unresolvedBlockers.has(issue.id)) continue;
       const topLevelRelations = blockersByBlockedIssueId.get(issue.id) ?? [];
       if (topLevelRelations.length === 0) {
+        if (hasActiveAggregateChildExecutionPath(issue)) continue;
         const missingPathFinding = blockedWithoutUnblockPathFinding(issue);
         if (missingPathFinding) findings.push(missingPathFinding);
         continue;

@@ -12,19 +12,20 @@ describe("StatusIcon", () => {
         blockerAttention={{
           state: "covered",
           reason: "active_child",
-          unresolvedBlockerCount: 1,
-          coveredBlockerCount: 1,
+          unresolvedBlockerCount: 0,
+          coveredBlockerCount: 0,
           stalledBlockerCount: 0,
           attentionBlockerCount: 0,
-          sampleBlockerIdentifier: "PAP-2",
+          activeChildCount: 1,
+          sampleBlockerIdentifier: null,
           sampleStalledBlockerIdentifier: null,
         }}
       />,
     );
 
     expect(html).toContain('data-blocker-attention-state="covered"');
-    expect(html).toContain('aria-label="Blocked · waiting on active sub-task PAP-2"');
-    expect(html).toContain('title="Blocked · waiting on active sub-task PAP-2"');
+    expect(html).toContain('aria-label="Blocked · waiting on 1 active sub-task"');
+    expect(html).toContain('title="Blocked · waiting on 1 active sub-task"');
     expect(html).toContain("border-cyan-600");
     expect(html).not.toContain("border-red-600");
     expect(html).not.toContain("border-dashed");

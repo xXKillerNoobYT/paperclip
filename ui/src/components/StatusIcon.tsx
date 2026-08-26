@@ -23,7 +23,7 @@ function blockedAttentionLabel(blockerAttention: IssueBlockerAttention | null | 
   if (!blockerAttention || blockerAttention.state === "none") return "Blocked";
 
   if (blockerAttention.reason === "active_child") {
-    const count = blockerAttention.coveredBlockerCount;
+    const count = blockerAttention.activeChildCount ?? blockerAttention.coveredBlockerCount;
     if (count === 1 && blockerAttention.sampleBlockerIdentifier) {
       return `Blocked · waiting on active sub-task ${blockerAttention.sampleBlockerIdentifier}`;
     }

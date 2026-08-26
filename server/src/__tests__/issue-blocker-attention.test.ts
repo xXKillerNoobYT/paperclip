@@ -146,30 +146,43 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     return runId;
   }
 
-  it("classifies a blocked parent as covered when its child has a running execution path", async () => {
+  it("re-reads 14 aggregate parents with active child work without blocker edges", async () => {
     const { companyId, agentId } = await createCompany("PBC");
-    const parentId = await insertIssue({ companyId, identifier: "PBC-1", title: "Parent", status: "blocked" });
-    const childId = await insertIssue({
-      companyId,
-      identifier: "PBC-2",
-      title: "Running child",
-      status: "todo",
-      parentId,
-      assigneeAgentId: agentId,
-    });
-    await block({ companyId, blockerIssueId: childId, blockedIssueId: parentId });
-    await activeRun({ companyId, agentId, issueId: childId });
+    const parentIds = await Promise.all(Array.from({ length: 14 }, async (_, index) => {
+      const parentId = await insertIssue({
+        companyId,
+        identifier: `PBC-${index * 2 + 1}`,
+        title: `Aggregate parent ${index + 1}`,
+        status: "blocked",
+      });
+      const childId = await insertIssue({
+        companyId,
+        identifier: `PBC-${index * 2 + 2}`,
+        title: `Running child ${index + 1}`,
+        status: "todo",
+        parentId,
+        assigneeAgentId: agentId,
+      });
+      await activeRun({ companyId, agentId, issueId: childId });
+      return parentId;
+    }));
 
-    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+    const parents = (await svc.list(companyId, { status: "blocked", includeBlockedBy: true }))
+      .filter((issue) => parentIds.includes(issue.id));
 
-    expect(parent?.blockerAttention).toMatchObject({
-      state: "covered",
-      reason: "active_child",
-      unresolvedBlockerCount: 1,
-      coveredBlockerCount: 1,
-      attentionBlockerCount: 0,
-      sampleBlockerIdentifier: "PBC-2",
-    });
+    expect(parents).toHaveLength(14);
+    for (const parent of parents) {
+      expect(parent.blockedBy).toEqual([]);
+      expect(parent.blockerAttention).toMatchObject({
+        state: "covered",
+        reason: "active_child",
+        unresolvedBlockerCount: 0,
+        coveredBlockerCount: 0,
+        attentionBlockerCount: 0,
+        activeChildCount: 1,
+        sampleBlockerIdentifier: null,
+      });
+    }
   });
 
   it("classifies an assigned backlog blocker leaf without a waiting path as attention-needed", async () => {
