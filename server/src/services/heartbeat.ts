@@ -134,7 +134,11 @@ import { issueService } from "./issues.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
+import {
+  buildIssueBlockersResolvedWakeIdempotencyKey,
+  findExistingIssueBlockersResolvedWake,
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+} from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -3001,37 +3005,6 @@ function allowsIssueInteractionWake(
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (!wakeReason || !ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(wakeReason)) return false;
   return Boolean(deriveCommentId(contextSnapshot, null));
-}
-
-async function listUnresolvedBlockerSummaries(
-  dbOrTx: Pick<Db, "select">,
-  companyId: string,
-  issueId: string,
-  unresolvedBlockerIssueIds: string[],
-) {
-  const ids = [...new Set(unresolvedBlockerIssueIds.filter(Boolean))];
-  if (ids.length === 0) return [];
-  return dbOrTx
-    .select({
-      id: issues.id,
-      identifier: issues.identifier,
-      title: issues.title,
-      status: issues.status,
-      priority: issues.priority,
-      assigneeAgentId: issues.assigneeAgentId,
-      assigneeUserId: issues.assigneeUserId,
-    })
-    .from(issueRelations)
-    .innerJoin(issues, eq(issueRelations.issueId, issues.id))
-    .where(
-      and(
-        eq(issueRelations.companyId, companyId),
-        eq(issueRelations.type, "blocks"),
-        eq(issueRelations.relatedIssueId, issueId),
-        inArray(issues.id, ids),
-      ),
-    )
-    .orderBy(asc(issues.title));
 }
 
 export function formatRuntimeWorkspaceWarningLog(warning: string) {
@@ -10274,7 +10247,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
-      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
+      if (unresolvedBlockerCount > 0) {
         await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
         logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
         return null;
@@ -10510,7 +10483,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (issue.status === "done" || issue.status === "cancelled") {
-      if (!resumeIntent && !wakeCommentId) {
+      // A comment is evidence, not an implicit resume command. A queued ordinary
+      // comment/mention wake must remain inert after the issue becomes terminal;
+      // only an explicit resume intent can revive it.
+      if (!resumeIntent) {
         return {
           stale: true,
           errorCode: "issue_terminal_status",
@@ -14157,6 +14133,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
 
+        const deferredResumeIntent =
+          promotedContextSeed.resumeIntent === true || promotedContextSeed.followUpRequested === true;
+        if (
+          (issue.status === "done" || issue.status === "cancelled") &&
+          deferredCommentIds.length > 0 &&
+          !shouldReopenDeferredCommentWake &&
+          !deferredResumeIntent
+        ) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "skipped",
+              finishedAt: new Date(),
+              error: "Deferred comment wake suppressed because the issue reached terminal status without a valid reopen trigger",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         const promotedReason = readNonEmptyString(deferred.reason) ?? "issue_execution_promoted";
         const promotedSource =
           (readNonEmptyString(deferred.source) as WakeupOptions["source"]) ?? "automation";
@@ -14635,6 +14631,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload,
     });
     let issueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? issueIdFromPayload;
+    const resolvedBlockerIssueId =
+      readNonEmptyString(parseObject(payload).resolvedBlockerIssueId) ??
+      readNonEmptyString(enrichedContextSnapshot.resolvedBlockerIssueId);
+    let idempotencyKey = opts.idempotencyKey ?? null;
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
@@ -14767,6 +14767,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
       }
+    }
+    if (!idempotencyKey && reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON && issueId && resolvedBlockerIssueId) {
+      idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        dependentIssueId: issueId,
+        resolvedBlockerIssueId,
+      });
     }
     // Propagate projectId into context so resolveWorkspaceForRun can bind the
     // project workspace even when context.projectId wasn't set by the caller.
@@ -15146,6 +15152,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .where(eq(issues.id, issue.id));
         }
 
+        // Every dependency-resolution producer enters this issue-row transaction.
+        // Claim the canonical key here, after the row lock, rather than relying on
+        // each producer's pre-enqueue lookup. This serializes route and recovery
+        // producers and preserves retries when a prior attempt was only skipped.
+        if (reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON && idempotencyKey) {
+          const existingWake = await findExistingIssueBlockersResolvedWake(tx, {
+            companyId: agent.companyId,
+            idempotencyKey,
+          });
+          if (existingWake) return { kind: "deduplicated" as const };
+        }
+
         if (!activeExecutionRun) {
           const legacyRun = await tx
             .select()
@@ -15193,27 +15211,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           tx,
         ).then((rows) => rows.get(issue.id) ?? null);
 
-        // Blocked descendants should stay idle until the final blocker resolves.
-        // Human comment/mention wakes are the exception: they may run in a
-        // bounded interaction mode so the assignee can answer or triage.
-        const blockedInteractionWake =
-          dependencyReadiness &&
-          !dependencyReadiness.isDependencyReady &&
-          allowsIssueInteractionWake(enrichedContextSnapshot);
-
-        if (blockedInteractionWake) {
-          enrichedContextSnapshot.dependencyBlockedInteraction = true;
-          enrichedContextSnapshot.unresolvedBlockerIssueIds = dependencyReadiness.unresolvedBlockerIssueIds;
-          enrichedContextSnapshot.unresolvedBlockerCount = dependencyReadiness.unresolvedBlockerCount;
-          enrichedContextSnapshot.unresolvedBlockerSummaries = await listUnresolvedBlockerSummaries(
-            tx,
-            issue.companyId,
-            issue.id,
-            dependencyReadiness.unresolvedBlockerIssueIds,
-          );
-        }
-
-        if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady && !blockedInteractionWake) {
+        if (!activeExecutionRun && dependencyReadiness && !dependencyReadiness.isDependencyReady) {
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,
@@ -15636,7 +15634,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             status: "queued",
             requestedByActorType: opts.requestedByActorType ?? null,
             requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
+            idempotencyKey,
           })
           .returning()
           .then((rows) => rows[0]);
@@ -15673,7 +15671,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "queued" as const, run: newRun };
       });
 
-      if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
+      if (outcome.kind === "deferred" || outcome.kind === "skipped" || outcome.kind === "deduplicated") return null;
       if (outcome.kind === "coalesced") {
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
