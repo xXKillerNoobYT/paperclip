@@ -325,6 +325,41 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("resolves explicit blocker terminals without traversing idle aggregate children", async () => {
+    const { companyId, agentId } = await createCompany("PBE");
+    const rootId = await insertIssue({ companyId, identifier: "PBE-1", title: "Root", status: "blocked" });
+    const dependencyId = await insertIssue({ companyId, identifier: "PBE-2", title: "Explicit dependency", status: "blocked" });
+    const explicitLeafId = await insertIssue({
+      companyId,
+      identifier: "PBE-3",
+      title: "Active explicit leaf",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await insertIssue({
+      companyId,
+      identifier: "PBE-4",
+      title: "Idle aggregate child",
+      status: "backlog",
+      parentId: dependencyId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: dependencyId, blockedIssueId: rootId });
+    await block({ companyId, blockerIssueId: explicitLeafId, blockedIssueId: dependencyId });
+    await activeRun({ companyId, agentId, issueId: explicitLeafId });
+
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+
+    expect(root?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBE-3",
+    });
+  });
+
   it("does not let another company's active run cover the blocker", async () => {
     const { companyId, agentId } = await createCompany("PBS");
     const other = await createCompany("PBT");
