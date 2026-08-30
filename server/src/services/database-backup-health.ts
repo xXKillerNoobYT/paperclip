@@ -115,20 +115,33 @@ function findRetainedIntermediateFiles(backupDir: string): string[] {
     .sort();
 }
 
-function readInvalidBackupFiles(backupDir: string): string[] {
+function readInvalidBackupFiles(backupDir: string): {
+  invalidBackupFiles: string[];
+  checkError?: string;
+} {
   const markerFile = resolve(backupDir, BACKUP_INTEGRITY_FAILURE_MARKER);
-  if (!existsSync(markerFile)) return [];
-  const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { invalidBackupFiles?: unknown };
-  if (!Array.isArray(parsed.invalidBackupFiles)) return [];
-  const resolvedBackupDir = resolve(backupDir);
-  return parsed.invalidBackupFiles
-    .filter((value): value is string => typeof value === "string")
-    .map((value) => resolve(value))
-    .filter((value) => {
-      const relativePath = relative(resolvedBackupDir, value);
-      return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath) && existsSync(value);
-    })
-    .sort();
+  if (!existsSync(markerFile)) return { invalidBackupFiles: [] };
+
+  try {
+    const parsed = JSON.parse(readFileSync(markerFile, "utf8")) as { invalidBackupFiles?: unknown };
+    if (!Array.isArray(parsed.invalidBackupFiles)) return { invalidBackupFiles: [] };
+    const resolvedBackupDir = resolve(backupDir);
+    return {
+      invalidBackupFiles: parsed.invalidBackupFiles
+        .filter((value): value is string => typeof value === "string")
+        .map((value) => resolve(value))
+        .filter((value) => {
+          const relativePath = relative(resolvedBackupDir, value);
+          return relativePath !== "" && !relativePath.startsWith("..") && !isAbsolute(relativePath) && existsSync(value);
+        })
+        .sort(),
+    };
+  } catch (error) {
+    return {
+      invalidBackupFiles: [],
+      checkError: `Failed to read database backup integrity marker: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 export function inspectDatabaseBackupHealth(
@@ -147,7 +160,15 @@ export function inspectDatabaseBackupHealth(
     latestBackup = findLatestBackup(opts.backupDir, now.getTime());
     lastFailure = readLastFailure(alertFileCandidates(opts));
     retainedIntermediateFiles = findRetainedIntermediateFiles(opts.backupDir);
-    invalidBackupFiles = readInvalidBackupFiles(opts.backupDir);
+    const integrityMarker = readInvalidBackupFiles(opts.backupDir);
+    invalidBackupFiles = integrityMarker.invalidBackupFiles;
+
+    if (integrityMarker.checkError) {
+      warnings.push({
+        code: "database_backup_check_failed",
+        message: integrityMarker.checkError,
+      });
+    }
 
     if (!latestBackup) {
       warnings.push({

@@ -265,6 +265,42 @@ describe("GET /health", () => {
     });
   });
 
+  it("keeps independent backup warnings when the integrity marker is corrupt", async () => {
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-corrupt-marker-"));
+    const backupFile = path.join(backupDir, "paperclip-20260706-031702.sql.gz");
+    const intermediateFile = `${backupFile}.partial-failed-run`;
+    const integrityMarker = path.join(backupDir, ".paperclip-backup-integrity-failures.json");
+    const alertFile = path.join(backupDir, "db-backup-to-s3.failure");
+    fs.writeFileSync(backupFile, gzipSync("SELECT 1;\n"));
+    fs.writeFileSync(intermediateFile, "incomplete gzip output");
+    fs.writeFileSync(integrityMarker, "{\"invalidBackupFiles\": [");
+    fs.writeFileSync(alertFile, "db-backup-to-s3 failed at 2026-07-06T03:17:00.000Z exit=1\n");
+    const app = createApp(createHealthyDb(), testServerInfo, {
+      enabled: true,
+      backupDir,
+      maxAgeHours: 26,
+      alertFile,
+      now: new Date("2026-07-06T04:00:00.000Z"),
+    });
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.databaseBackup).toMatchObject({
+      status: "warning",
+      retainedIntermediateFiles: [intermediateFile],
+      invalidBackupFiles: [],
+    });
+    expect(res.body.databaseBackup.warnings).toEqual(expect.arrayContaining([
+      {
+        code: "database_backup_check_failed",
+        message: expect.stringContaining("Failed to read database backup integrity marker"),
+      },
+      { code: "database_backup_incomplete", message: expect.stringContaining(intermediateFile) },
+      { code: "database_backup_last_failure", message: expect.stringContaining("db-backup-to-s3 failed") },
+    ]));
+  });
+
   it("surfaces redacted database backup warnings for anonymous authenticated probes", async () => {
     const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-redacted-backups-"));
     const backupFile = path.join(backupDir, "paperclip-20260705-031702.sql.gz");
