@@ -19,10 +19,14 @@ export {
   type EmbeddedPostgresTestSupport,
 } from "./test-embedded-postgres.js";
 export {
+  BACKUP_INTEGRITY_FAILURE_MARKER,
+  DatabaseBackupError,
+  getDatabaseBackupRetainedArtifacts,
   runDatabaseBackup,
   runDatabaseRestore,
   formatDatabaseBackupResult,
   type BackupRetentionPolicy,
+  type DatabaseBackupDiagnostic,
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,
   type RunDatabaseRestoreOptions,

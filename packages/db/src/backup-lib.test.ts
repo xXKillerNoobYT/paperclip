@@ -1,10 +1,19 @@
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { gunzipSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { gzipSync, gunzipSync } from "node:zlib";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  DatabaseBackupError,
+  pruneOldBackups,
+  publishVerifiedGzip,
+  runDatabaseBackup,
+  runDatabaseRestore,
+  verifyGzipFile,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -74,9 +83,330 @@ describe("createBufferedTextFileWriter", () => {
   });
 });
 
+describe("atomic backup publication", () => {
+  it("retains a truncated gzip intermediate without publishing a final archive", async () => {
+    const tempDir = createTempDir("paperclip-truncated-backup-");
+    const intermediateFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz.partial-test-run");
+    const backupFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz");
+    const complete = gzipSync("SELECT 1;\n");
+    fs.writeFileSync(intermediateFile, complete.subarray(0, complete.length - 4));
+
+    await expect(publishVerifiedGzip(intermediateFile, backupFile)).rejects.toMatchObject({
+      retainedArtifacts: [intermediateFile],
+    });
+
+    expect(fs.existsSync(backupFile)).toBe(false);
+    expect(fs.existsSync(intermediateFile)).toBe(true);
+    await expect(verifyGzipFile(intermediateFile)).rejects.toThrow();
+  });
+
+  it("atomically publishes a valid gzip and removes only that intermediate", async () => {
+    const tempDir = createTempDir("paperclip-valid-backup-");
+    const intermediateFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz.partial-test-run");
+    const unrelatedIntermediate = path.join(tempDir, "paperclip-20260715-010204.sql.gz.partial-other-run");
+    const backupFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz");
+    fs.writeFileSync(intermediateFile, gzipSync("SELECT 1;\n"));
+    fs.writeFileSync(unrelatedIntermediate, "other run");
+
+    await publishVerifiedGzip(intermediateFile, backupFile);
+
+    await expect(verifyGzipFile(backupFile)).resolves.toBeUndefined();
+    expect(fs.existsSync(intermediateFile)).toBe(false);
+    expect(fs.existsSync(unrelatedIntermediate)).toBe(true);
+  });
+
+  it("never replaces an existing final archive during concurrent publication", async () => {
+    const tempDir = createTempDir("paperclip-concurrent-backup-");
+    const intermediateFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz.partial-second-run");
+    const backupFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz");
+    const firstArchive = gzipSync("SELECT 'first';\n");
+    fs.writeFileSync(backupFile, firstArchive);
+    fs.writeFileSync(intermediateFile, gzipSync("SELECT 'second';\n"));
+
+    await expect(publishVerifiedGzip(intermediateFile, backupFile)).rejects.toMatchObject({
+      retainedArtifacts: [intermediateFile],
+    });
+
+    expect(fs.readFileSync(backupFile)).toEqual(firstArchive);
+    expect(fs.existsSync(intermediateFile)).toBe(true);
+  });
+
+  it("never overwrites a destination created between validation and publication", async () => {
+    const tempDir = createTempDir("paperclip-publication-race-");
+    const intermediateFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz.partial-run");
+    const backupFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz");
+    const competingArchive = gzipSync("SELECT 'competing writer';\n");
+    fs.writeFileSync(intermediateFile, gzipSync("SELECT 'this run';\n"));
+
+    const realLinkSync = fs.linkSync;
+    const linkSpy = vi.spyOn(fs, "linkSync").mockImplementation((existingPath, newPath) => {
+      if (existingPath === intermediateFile && newPath === backupFile) {
+        fs.writeFileSync(backupFile, competingArchive);
+      }
+      return realLinkSync(existingPath, newPath);
+    });
+    syncBuiltinESMExports();
+
+    try {
+      await expect(publishVerifiedGzip(intermediateFile, backupFile)).rejects.toMatchObject({
+        retainedArtifacts: [intermediateFile],
+      });
+    } finally {
+      linkSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+
+    expect(fs.readFileSync(backupFile)).toEqual(competingArchive);
+    expect(fs.existsSync(intermediateFile)).toBe(true);
+  });
+
+  it("reports post-publication cleanup separately without failing the durable backup", async () => {
+    const tempDir = createTempDir("paperclip-publication-cleanup-");
+    const intermediateFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz.partial-run");
+    const backupFile = path.join(tempDir, "paperclip-20260715-010203.sql.gz");
+    const archive = gzipSync("SELECT 'durable';\n");
+    fs.writeFileSync(intermediateFile, archive);
+
+    const realUnlinkSync = fs.unlinkSync;
+    const unlinkSpy = vi.spyOn(fs, "unlinkSync").mockImplementation((filePath) => {
+      if (filePath === intermediateFile) {
+        throw new Error("simulated cleanup failure");
+      }
+      return realUnlinkSync(filePath);
+    });
+    syncBuiltinESMExports();
+
+    try {
+      await expect(publishVerifiedGzip(intermediateFile, backupFile)).resolves.toEqual([intermediateFile]);
+    } finally {
+      unlinkSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+
+    await expect(verifyGzipFile(backupFile)).resolves.toBeUndefined();
+    expect(fs.readFileSync(backupFile)).toEqual(archive);
+    expect(fs.existsSync(intermediateFile)).toBe(true);
+  });
+});
+
+describe("integrity-aware backup retention", () => {
+  it("counts only valid automatic archives, keeps 24, and preserves manual and invalid files", async () => {
+    const tempDir = createTempDir("paperclip-backup-retention-");
+    const now = new Date("2026-07-15T12:00:00.000Z");
+    const automaticFiles: string[] = [];
+
+    for (let index = 0; index < 30; index += 1) {
+      const stamp = String(index).padStart(2, "0");
+      const filePath = path.join(tempDir, `paperclip-20260501-00${stamp}00.sql.gz`);
+      fs.writeFileSync(filePath, gzipSync(`SELECT ${index};\n`));
+      const mtime = new Date(now.getTime() - (60 + index) * 86_400_000);
+      fs.utimesSync(filePath, mtime, mtime);
+      automaticFiles.push(filePath);
+    }
+
+    const manualFile = path.join(tempDir, "paperclip-manual-20260501-010101.sql.gz");
+    const legacyManualFile = path.join(tempDir, "manual.sql");
+    const invalidAutomaticFile = path.join(tempDir, "paperclip-20260401-010101.sql.gz");
+    fs.writeFileSync(manualFile, gzipSync("SELECT 'manual';\n"));
+    fs.writeFileSync(legacyManualFile, "SELECT 'legacy';\n");
+    fs.writeFileSync(invalidAutomaticFile, gzipSync("SELECT 'invalid';\n").subarray(0, 8));
+
+    const result = await pruneOldBackups(
+      tempDir,
+      { dailyDays: 1, weeklyWeeks: 1, monthlyMonths: 1 },
+      "paperclip",
+      now,
+    );
+
+    expect(result.prunedCount).toBe(6);
+    expect(result.invalidBackupFiles).toEqual([invalidAutomaticFile]);
+    expect(automaticFiles.filter((filePath) => fs.existsSync(filePath))).toHaveLength(24);
+    expect(fs.existsSync(manualFile)).toBe(true);
+    expect(fs.existsSync(legacyManualFile)).toBe(true);
+    expect(fs.existsSync(invalidAutomaticFile)).toBe(true);
+  });
+
+  it("never deletes the only valid automatic backup", async () => {
+    const tempDir = createTempDir("paperclip-backup-retention-floor-");
+    const onlyBackup = path.join(tempDir, "paperclip-20260101-010101.sql.gz");
+    fs.writeFileSync(onlyBackup, gzipSync("SELECT 1;\n"));
+    fs.utimesSync(onlyBackup, new Date("2026-01-01T01:01:01.000Z"), new Date("2026-01-01T01:01:01.000Z"));
+
+    const result = await pruneOldBackups(
+      tempDir,
+      { dailyDays: 1, weeklyWeeks: 1, monthlyMonths: 1 },
+      "paperclip",
+      new Date("2026-07-15T12:00:00.000Z"),
+    );
+
+    expect(result.prunedCount).toBe(0);
+    expect(fs.existsSync(onlyBackup)).toBe(true);
+  });
+
+  it("revalidates cached archives before pruning below the 24-valid floor", async () => {
+    const tempDir = createTempDir("paperclip-backup-stale-cache-");
+    const now = new Date("2026-07-15T12:00:00.000Z");
+
+    for (let index = 0; index < 25; index += 1) {
+      const stamp = String(index).padStart(2, "0");
+      const filePath = path.join(tempDir, `paperclip-20260501-00${stamp}00.sql.gz`);
+      fs.writeFileSync(filePath, gzipSync(`SELECT ${index};\n`));
+      const mtime = new Date(now.getTime() - (60 + index) * 86_400_000);
+      fs.utimesSync(filePath, mtime, mtime);
+    }
+
+    const retention = { dailyDays: 1, weeklyWeeks: 1, monthlyMonths: 1 };
+    const firstResult = await pruneOldBackups(tempDir, retention, "paperclip", now);
+    expect(firstResult.prunedCount).toBe(1);
+
+    const retainedArchives = fs.readdirSync(tempDir)
+      .filter((name) => /^paperclip-\d{8}-\d{6}\.sql\.gz$/.test(name))
+      .map((name) => path.join(tempDir, name));
+    expect(retainedArchives).toHaveLength(24);
+
+    const corruptedArchive = retainedArchives[0]!;
+    const originalStat = fs.statSync(corruptedArchive);
+    fs.writeFileSync(corruptedArchive, Buffer.alloc(originalStat.size));
+    fs.utimesSync(corruptedArchive, originalStat.atime, originalStat.mtime);
+
+    const replacementArchive = path.join(tempDir, "paperclip-20260502-010101.sql.gz");
+    fs.writeFileSync(replacementArchive, gzipSync("SELECT 'replacement';\n"));
+    const replacementMtime = new Date(now.getTime() - 59 * 86_400_000);
+    fs.utimesSync(replacementArchive, replacementMtime, replacementMtime);
+
+    const secondResult = await pruneOldBackups(tempDir, retention, "paperclip", now);
+    expect(secondResult.prunedCount).toBe(0);
+    expect(secondResult.invalidBackupFiles).toEqual([corruptedArchive]);
+
+    const validArchives = fs.readdirSync(tempDir)
+      .filter((name) => /^paperclip-\d{8}-\d{6}\.sql\.gz$/.test(name))
+      .map((name) => path.join(tempDir, name));
+    const validity = await Promise.all(validArchives.map(async (filePath) => {
+      try {
+        await verifyGzipFile(filePath);
+        return true;
+      } catch {
+        return false;
+      }
+    }));
+    expect(validity.filter(Boolean)).toHaveLength(24);
+  });
+});
+
 describeEmbeddedPostgres("runDatabaseBackup", () => {
   it(
-    "backs up and restores large table payloads without materializing one giant string",
+    "reports retained run artifacts and publishes no final when full-run publication fails",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-publication-failure-");
+      const realLinkSync = fs.linkSync;
+      const linkSpy = vi.spyOn(fs, "linkSync").mockImplementation((existingPath, newPath) => {
+        if (
+          typeof existingPath === "string"
+          && typeof newPath === "string"
+          && existingPath.startsWith(backupDir)
+          && existingPath.includes(".sql.gz.partial-")
+          && newPath.startsWith(backupDir)
+          && newPath.endsWith(".sql.gz")
+        ) {
+          throw Object.assign(new Error("simulated full-run publication failure"), { code: "EIO" });
+        }
+        return realLinkSync(existingPath, newPath);
+      });
+      syncBuiltinESMExports();
+
+      let backupError: unknown;
+      try {
+        await runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-failure-lifecycle",
+          backupEngine: "javascript",
+        });
+      } catch (error) {
+        backupError = error;
+      } finally {
+        linkSpy.mockRestore();
+        syncBuiltinESMExports();
+      }
+
+      expect(backupError).toBeInstanceOf(DatabaseBackupError);
+      const retainedArtifacts = (backupError as DatabaseBackupError).retainedArtifacts;
+      expect(retainedArtifacts).toHaveLength(2);
+      expect(retainedArtifacts.every((filePath) => fs.existsSync(filePath))).toBe(true);
+      expect(retainedArtifacts.some((filePath) => filePath.includes(".sql.gz.partial-"))).toBe(true);
+      expect(retainedArtifacts.some((filePath) => filePath.endsWith(".sql"))).toBe(true);
+      expect(
+        fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql.gz")),
+      ).toEqual([]);
+    },
+    60_000,
+  );
+
+  it(
+    "returns a valid final and diagnoses retained cleanup artifacts after full-run publication",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-cleanup-failure-");
+      const unrelatedArtifact = path.join(backupDir, "paperclip-other.sql.gz.partial-other-run");
+      const unrelatedContents = "unrelated run artifact";
+      fs.writeFileSync(unrelatedArtifact, unrelatedContents);
+      const diagnostics: Array<{
+        code: string;
+        backupFile: string;
+        retainedArtifacts?: string[];
+      }> = [];
+      const realUnlinkSync = fs.unlinkSync;
+      const unlinkSpy = vi.spyOn(fs, "unlinkSync").mockImplementation((filePath) => {
+        if (
+          typeof filePath === "string"
+          && filePath.startsWith(backupDir)
+          && filePath.includes("paperclip-cleanup-lifecycle-")
+          && filePath.includes(".sql.gz.partial-")
+          && !filePath.endsWith(".sql")
+        ) {
+          throw new Error("simulated full-run cleanup failure");
+        }
+        return realUnlinkSync(filePath);
+      });
+      syncBuiltinESMExports();
+
+      let result;
+      try {
+        result = await runDatabaseBackup({
+          connectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-cleanup-lifecycle",
+          backupEngine: "javascript",
+          onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+        });
+      } finally {
+        unlinkSpy.mockRestore();
+        syncBuiltinESMExports();
+      }
+
+      expect(result).toBeDefined();
+      await expect(verifyGzipFile(result!.backupFile)).resolves.toBeUndefined();
+      expect(fs.readFileSync(unrelatedArtifact, "utf8")).toBe(unrelatedContents);
+      const cleanupDiagnostic = diagnostics.find((diagnostic) => diagnostic.code === "cleanup_failed");
+      expect(cleanupDiagnostic).toMatchObject({
+        code: "cleanup_failed",
+        backupFile: result!.backupFile,
+      });
+      expect(cleanupDiagnostic?.retainedArtifacts).toHaveLength(1);
+      const retainedPath = cleanupDiagnostic?.retainedArtifacts?.[0];
+      expect(retainedPath).toContain("paperclip-cleanup-lifecycle-");
+      expect(retainedPath).toContain(".sql.gz.partial-");
+      expect(retainedPath && fs.existsSync(retainedPath)).toBe(true);
+      expect(retainedPath).not.toBe(unrelatedArtifact);
+    },
+    60_000,
+  );
+
+  it(
+    "restores large COPY payloads through the no-psql incremental stream",
     async () => {
       const sourceConnectionString = await createTempDatabase();
       const restoreConnectionString = await createSiblingDatabase(
@@ -86,6 +416,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       const backupDir = createTempDir("paperclip-db-backup-output-");
       const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
       const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+      const originalPsqlPath = process.env.PAPERCLIP_PSQL_PATH;
 
       try {
         await sourceSql.unsafe(`
@@ -135,6 +466,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         expect(result.sizeBytes).toBeGreaterThan(0);
         expect(fs.existsSync(result.backupFile)).toBe(true);
 
+        process.env.PAPERCLIP_PSQL_PATH = "/bin/false";
         await runDatabaseRestore({
           connectionString: restoreConnectionString,
           backupFile: result.backupFile,
@@ -175,6 +507,11 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
           },
         ]);
       } finally {
+        if (originalPsqlPath === undefined) {
+          delete process.env.PAPERCLIP_PSQL_PATH;
+        } else {
+          process.env.PAPERCLIP_PSQL_PATH = originalPsqlPath;
+        }
         await sourceSql.end();
         await restoreSql.end();
       }

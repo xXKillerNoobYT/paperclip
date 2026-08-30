@@ -81,6 +81,8 @@ async function main() {
       backupDir,
       retention: { dailyDays: retentionDays, weeklyWeeks: 4, monthlyMonths: 1 },
       filenamePrefix: "paperclip",
+      backupKind: "manual",
+      onDiagnostic: (diagnostic) => console.warn("Backup maintenance warning:", diagnostic),
     });
 
     console.log(`Backup saved: ${formatDatabaseBackupResult(result)}`);
